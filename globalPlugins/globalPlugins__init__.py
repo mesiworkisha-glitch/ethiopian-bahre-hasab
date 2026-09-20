@@ -99,6 +99,10 @@ SHORTCUT_REGISTRY = {
     "planning": {"label": "ዕቅድ አዘጋጅ", "default": True, "gesture": "kb:control+alt+y"},
     "agenda": {"label": "አጀንዳ", "default": True, "gesture": "kb:control+alt+a"},
     "agendaPage": {"label": "አጀንዳ በመስኮት", "default": True, "gesture": "kb:control+shift+alt+a"},
+    "dayAgenda": {"label": "የቀን አጀንዳ", "default": True, "gesture": "kb:control+alt+d"},
+    "gitsaweByDate": {"label": "በግጻዌ በቀን ፈልግ", "default": True, "gesture": ""},
+    "gitsaweStructure": {"label": "የግጻዌ መጽሐፍ ማውጫ", "default": True, "gesture": "kb:control+alt+s"},
+    "holidaysIcal": {"label": "የዓመቱን በዓላት ወደ iCal ላክ", "default": True, "gesture": "kb:control+alt+h"},
 }
 
 # ============================================================
@@ -113,10 +117,15 @@ def guarded_by_shortcut_setting(script_id=None):
         @functools.wraps(func)
         def wrapper(self, gesture, *args, **kwargs):
             sid = script_id if script_id is not None else func.__name__.replace("script_", "")
-            if not getattr(self, "shortcuts_enabled", True):
-                return
-            if not self.is_shortcut_enabled(sid):
-                return
+            if gesture is not None:
+                if not getattr(self, "shortcuts_enabled", True) or not self.is_shortcut_enabled(sid):
+                    logHandler.log.info(f"Ethiopian Calendar: shortcut '{sid}' is turned off; key passed through")
+                    try:
+                        gesture.send()
+                    except Exception:
+                        pass
+                    return
+            logHandler.log.info(f"Ethiopian Calendar: running '{sid}'")
             return func(self, gesture, *args, **kwargs)
         return wrapper
     return decorator
@@ -196,7 +205,7 @@ class ShortcutSettingsDialog(wx.Dialog):
         self.shortcut_ids = []
 
         categories = {
-            "የኢትዮጵያ ቀን አቆጣጠር": ["fullInfo", "fullDateHtml", "fdreHolidays", "ethiopianLocalTime",
+            "የኢትዮጵያ ቀን አቆጣጠር": ["fullInfo", "fullDateHtml", "fdreHolidays", "holidaysIcal", "ethiopianLocalTime",
                                        "kekrosTime", "copyDate", "upcomingEvent", "movableFeasts",
                                        "readSynaxarium", "readMonthlyFeasts", "searchSynaxarium",
                                        "yearlyFeasts", "searchDate", "searchGregorianDate",
@@ -205,7 +214,8 @@ class ShortcutSettingsDialog(wx.Dialog):
             "የዕብራውያን ቀን አቆጣጠር": ["searchHebrewDate"],
             "የወር አበባ፣ እርግዝና እና ዕድሜ": ["periodicSettings", "announcePeriodic", "clearPeriodicData",
                                                "calculatePregnancy", "calculateAge"],
-            "የግጻዌ፣ ዕቅድ እና አጀንዳ": ["gitsaweSearch", "planning", "agenda", "agendaPage"],
+            "የግጻዌ፣ ዕቅድ እና አጀንዳ": ["gitsaweSearch", "gitsaweByDate", "gitsaweStructure", "planning", "agenda",
+                                          "agendaPage", "dayAgenda"],
         }
 
         current_settings = plugin.load_shortcut_settings()
@@ -685,10 +695,7 @@ def render_gitsawe_html(plugin, blocks, title, em, ed, commemoration=""):
                 .replace("<", "&lt;")
                 .replace(">", "&gt;"))
 
-    parts = []
-    parts.append("<html><head><meta charset='utf-8'></head><body ")
-    parts.append("style=\"font-family:'Nyala','Kefa','Abyssinica SIL','Visual Geez Unicode',sans-serif; line-height:1.6;\">")
-
+    parts = ["<main lang='am' style='line-height:1.6;'>"]
     parts.append(f"<h1>{esc(title)}</h1>")
     if commemoration:
         parts.append(f"<p><strong>መታሰቢያ፦</strong> {esc(commemoration)}</p>")
@@ -701,7 +708,7 @@ def render_gitsawe_html(plugin, blocks, title, em, ed, commemoration=""):
 
         elif kind == "mesbak_header":
             cv = blk.get("cv", "")
-            book = blk.get("book", "መዝሙር")
+            book = blk.get("book") or "መዝሙር"
             pm = blk.get("psalm_masoretic")
             heading = f"ምስባክ — {book} {cv}"
             if pm:
@@ -761,7 +768,7 @@ def render_gitsawe_html(plugin, blocks, title, em, ed, commemoration=""):
         elif kind == "empty":
             parts.append(f"<p>{esc(blk['text'])}</p>")
 
-    parts.append("</body></html>")
+    parts.append("</main>")
     return "".join(parts)
 
 
@@ -799,433 +806,636 @@ def _append_bible_passage_html(parts, result, esc):
 # ============================================================
 # PLANNING / AGENDA HTML RENDERERS
 # ============================================================
-def render_plan_html(plugin, plan):
-    """
-    Render a plan as a navigable HTML page.
+PLAN_STATUS_KEYS = ["planned", "in-progress", "done", "skipped"]
 
-    Structure:
-      <h1>  plan name
-      <h2>  summary (period, interval, season filter, count)
-      <h2>  rows
-      <table> per-row columns: date | climate | fasting | liturgical | lent | title | details | status
-    """
-    def esc(s):
-        return (str(s or "")
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
+PLAN_STATUS_LABELS = {
+    "planned": "ታቅዷል",
+    "in-progress": "በሂደት",
+    "done": "ተጠናቋል",
+    "skipped": "ተዘለለ",
+}
 
-    name = plan.get("name", "Ethiopian Plan")
+PLAN_UNIT_LABELS = {
+    "day": "ቀን",
+    "week": "ሳምንት",
+    "month": "ወር",
+    "year": "ዓመት",
+    "custom": "የተወሰነ የቀን ክልል",
+}
+
+PLAN_FAMILY_KEYS = ["all", "none", "climatic", "fasting", "liturgical", "lent-week"]
+
+PLAN_FAMILY_LABELS = {
+    "all": "ሁሉም ቀናት",
+    "none": "ምንም",
+    "climatic": "የአየር ወቅት",
+    "fasting": "የጾም ወቅት",
+    "liturgical": "የቤተክርስቲያን ዘመን",
+    "lent-week": "የዐቢይ ጾም ሳምንት",
+}
+
+PLAN_COLUMNS = [
+    ("climatic", "climatic", "የአየር ወቅት"),
+    ("fasting", "fasting", "የጾም ወቅት"),
+    ("liturgical", "liturgical", "የቤተክርስቲያን ዘመን"),
+    ("lent", "greatLentWeek", "የዐቢይ ጾም ሳምንት"),
+]
+
+PLAN_SEASON_CATALOGS = {
+    "climatic": [("autumn", "መፀው (Autumn)"), ("summer", "በጋ (Summer)"),
+                 ("spring", "በልግ (Spring)"), ("winter", "ክረምት (Winter)")],
+    "fasting": [("none", "የአጽዋም ዘመን አይደለም"), ("abiy", "ዐቢይ ጾም"),
+                ("nebiyat", "ጾመ ነቢያት"), ("filseta", "ጾመ ፍልሰታ"),
+                ("hawaryat", "ጾመ ሐዋርያት"), ("nenewe", "ጾመ ነነዌ"),
+                ("gehad", "ጾመ ገሀድ"), ("hamsa", "ኀምሳ ዕለት"), ("dihnet", "ጾመ ድኅነት")],
+    "liturgical": [(x, x) for x in ["ዘመነ ዮሐንስ", "ዘካርያስ", "ዘመነ ፍሬ", "ዘመነ መስቀል",
+                                     "ዘመነ ጽጌ", "ዘመነ አስተምሕሮ", "ዘመነ ስብከት",
+                                     "ዘመነ ብርሃን", "ዘመነ ኖላዊ", "ዘመነ መርዓዊ",
+                                     "አማኑኤል", "ዘመነ ልደት", "ናዝሬት", "ገሐድ",
+                                     "ዘመነ ጥምቀት", "ዘመነ ነነዌ", "ዘመነ ጾም",
+                                     "ዘመነ ትንሣኤ", "ዘመነ ዕርገት", "ዘመነ ጰራቅሊጦስ",
+                                     "ደመና፣ ዘርዕ፣ ዝናም", "መብረቅ፣ ባሕር",
+                                     "ዐይነ ኵሉ፣ ዕጕለ ቋዓት", "ጎሕ፣ ነግሕ"]],
+    "lent-week": list(zip(GREAT_LENT_WEEK_KEYS, GREAT_LENT_WEEK_NAMES_AM)),
+}
+
+
+def plan_status_label(key):
+    return PLAN_STATUS_LABELS.get(key, key or "")
+
+
+def plan_season_filter_label(category, season_id):
+    family = PLAN_FAMILY_LABELS.get(category, str(category))
+    if category in PLAN_SEASON_CATALOGS and season_id not in (None, "", "all"):
+        names = dict(PLAN_SEASON_CATALOGS[category])
+        return f"{family}፦ {names.get(season_id, season_id)}"
+    return family
+
+
+def _html_escape(s):
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def eth_date_label(plugin, d):
+    try:
+        weekday = WEEKDAYS[plugin.eth_to_gregorian(d["ey"], d["em"], d["ed"]).weekday()]
+        return f"{weekday}፣ {plugin.get_month_name(d['em'])} {d['ed']} {d['ey']}"
+    except Exception:
+        return f"{plugin.get_month_name(d.get('em') or 0)} {d.get('ed', '')} {d.get('ey', '')}"
+
+
+def _month_group_label(plugin, key):
+    ey, em = key
+    return f"{plugin.get_month_name(em or 0)} {ey if ey is not None else ''}".strip()
+
+
+def _group_by_month(items):
+    groups = []
+    for it in items:
+        d = it.get("date") or {}
+        key = (d.get("ey"), d.get("em"))
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(it)
+        else:
+            groups.append((key, [it]))
+    return groups
+
+
+def _html_table(caption, headers, rows):
+    out = ["<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;'>",
+           f"<caption>{_html_escape(caption)}</caption>", "<thead><tr>"]
+    for h in headers:
+        out.append(f"<th scope='col'>{_html_escape(h)}</th>")
+    out.append("</tr></thead><tbody>")
+    for cells in rows:
+        out.append("<tr>")
+        for i, c in enumerate(cells):
+            if i == 0:
+                out.append(f"<th scope='row'>{_html_escape(c)}</th>")
+            else:
+                out.append(f"<td>{_html_escape(c)}</td>")
+        out.append("</tr>")
+    out.append("</tbody></table>")
+    return "".join(out)
+
+
+def _html_month_nav(label, prefix, groups, plugin):
+    if len(groups) < 2:
+        return ""
+    links = "".join(
+        f"<li><a href='#{prefix}-{n}'>{_html_escape(_month_group_label(plugin, key))} ({len(members)})</a></li>"
+        for n, (key, members) in enumerate(groups)
+    )
+    return f"<nav aria-label='{_html_escape(label)}'><ul>{links}</ul></nav>"
+
+
+def render_plan_html(plugin, plan, columns=None):
+    columns = columns or {}
+    shown = [c for c in PLAN_COLUMNS if columns.get(c[0], True)]
+    name = plan.get("name") or "Ethiopian Plan"
     rows = plan.get("rows", [])
     period_mode = plan.get("periodMode", "duration")
     period_value = plan.get("periodValue", 1)
     period_unit = plan.get("periodUnit", "day")
     interval_value = plan.get("intervalValue", 1)
     interval_unit = plan.get("intervalUnit", "day")
-    season_cat = plan.get("seasonCategory", "all")
-    season_id = plan.get("seasonId", "all")
 
-    parts = []
-    parts.append("<html><head><meta charset='utf-8'></head><body ")
-    parts.append("style=\"font-family:'Nyala','Kefa','Abyssinica SIL','Visual Geez Unicode',sans-serif; line-height:1.6;\">")
+    parts = ["<main lang='am'>", f"<h1>{_html_escape(name)}</h1>"]
 
-    parts.append(f"<h1>{esc(name)}</h1>")
-
-    parts.append("<h2>የዕቅዱ ማጠቃለያ</h2>")
-    parts.append("<ul>")
+    parts.append("<h2>የዕቅዱ ማጠቃለያ</h2><ul>")
     if period_mode == "date-range":
-        end = plan.get("endDate", {})
-        end_label = (f"{plugin.get_month_name(end.get('em',''))} {end.get('ed','')} "
-                     f"{end.get('ey','')}") if end else "—"
-        parts.append(f"<li><strong>የዕቅድ ዓይነት፦</strong> እስከ ተወሰነ ቀን ({esc(end_label)})</li>")
+        end = plan.get("endDate") or {}
+        end_label = eth_date_label(plugin, end) if end else "—"
+        parts.append(f"<li><strong>የዕቅድ ዓይነት፦</strong> እስከ ተወሰነ ቀን ({_html_escape(end_label)})</li>")
     else:
-        parts.append(f"<li><strong>የዕቅድ ጊዜ፦</strong> {period_value} {esc(period_unit)}</li>")
-    parts.append(f"<li><strong>የድግግሞሽ ክፍተት፦</strong> በየ {interval_value} {esc(interval_unit)}</li>")
-    parts.append(f"<li><strong>የወቅት ማጣሪያ፦</strong> {esc(season_cat)} / {esc(season_id)}</li>")
+        unit_label = PLAN_UNIT_LABELS.get(period_unit, period_unit)
+        parts.append(f"<li><strong>የዕቅድ ጊዜ፦</strong> {_html_escape(period_value)} {_html_escape(unit_label)}</li>")
+    interval_label = PLAN_UNIT_LABELS.get(interval_unit, interval_unit)
+    parts.append(f"<li><strong>የድግግሞሽ ክፍተት፦</strong> በየ {_html_escape(interval_value)} {_html_escape(interval_label)}</li>")
+    parts.append("<li><strong>የወቅት ማጣሪያ፦</strong> "
+                 + _html_escape(plan_season_filter_label(plan.get("seasonCategory", "all"),
+                                                         plan.get("seasonId", "all")))
+                 + "</li>")
     parts.append(f"<li><strong>የቀናት ብዛት፦</strong> {len(rows)}</li>")
     parts.append("</ul>")
 
     if not rows:
-        parts.append("<p>ምንም ቀን አልተፈጠረም።</p>")
-        parts.append("</body></html>")
+        parts.append("<p>ምንም ቀን አልተፈጠረም።</p></main>")
         return "".join(parts)
 
-    parts.append("<h2>ዕቅድ ቀናት</h2>")
-    parts.append("<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;'>")
-    parts.append("<thead><tr>")
-    head = ["ቀን", "የአየር ወቅት", "የጾም ወቅት", "የቤ/ክ ዘመን", "ዐቢይ ጾም",
-            "ነገር", "ዝርዝር", "ሁኔታ"]
-    for h in head:
-        parts.append(f"<th>{esc(h)}</th>")
-    parts.append("</tr></thead><tbody>")
+    groups = _group_by_month(rows)
+    parts.append("<h2>የዕቅድ ቀናት</h2>")
+    parts.append(_html_month_nav("የወራት ማውጫ", "plan-month", groups, plugin))
 
-    for r in rows:
-        d = r.get("date", {})
-        season = r.get("season", {}) or {}
-        date_label = f"{plugin.get_month_name(d.get('em',''))} {d.get('ed','')} {d.get('ey','')}"
-        parts.append("<tr>")
-        parts.append(f"<td>{esc(date_label)}</td>")
-        parts.append(f"<td>{esc(season.get('climatic',''))}</td>")
-        parts.append(f"<td>{esc(season.get('fasting',''))}</td>")
-        parts.append(f"<td>{esc(season.get('liturgical',''))}</td>")
-        parts.append(f"<td>{esc(season.get('greatLentWeek',''))}</td>")
-        parts.append(f"<td>{esc(r.get('title',''))}</td>")
-        parts.append(f"<td>{esc(r.get('details',''))}</td>")
-        parts.append(f"<td>{esc(r.get('status','planned'))}</td>")
-        parts.append("</tr>")
+    head = ["ቀን", "የዕቅድ ነገር", "ዝርዝር", "ሁኔታ"] + [c[2] for c in shown]
+    for n, (key, members) in enumerate(groups):
+        month_label = _month_group_label(plugin, key)
+        parts.append(f"<h3 id='plan-month-{n}'>{_html_escape(month_label)} ({len(members)} ቀናት)</h3>")
+        table_rows = []
+        for r in members:
+            season = r.get("season") or {}
+            table_rows.append([
+                eth_date_label(plugin, r.get("date") or {}),
+                r.get("title", ""),
+                r.get("details", ""),
+                plan_status_label(r.get("status", "planned")),
+            ] + [season.get(c[1], "") for c in shown])
+        parts.append(_html_table(f"{month_label} ዕቅድ ቀናት", head, table_rows))
 
-    parts.append("</tbody></table>")
-    parts.append("</body></html>")
+    parts.append("</main>")
     return "".join(parts)
 
 
-def render_agenda_html(plugin, items, title="አጀንዳ"):
-    """
-    Render the full agenda as a navigable HTML page.
+AGENDA_BUCKETS = [
+    ("overdue", "ያለፈ ጊዜው"),
+    ("today", "ዛሬ"),
+    ("upcoming", "መጪ"),
+]
 
-    Structure:
-      <h1>  title
-      <h2>  personal events
-      <ul>
-      <h2>  tasks
-      <table> per-row columns: date | plan | title | details | status | seasons
-    """
-    def esc(s):
-        return (str(s or "")
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;"))
 
-    parts = []
-    parts.append("<html><head><meta charset='utf-8'></head><body ")
-    parts.append("style=\"font-family:'Nyala','Kefa','Abyssinica SIL','Visual Geez Unicode',sans-serif; line-height:1.6;\">")
+def render_agenda_html(plugin, buckets):
+    total = sum(len(buckets[k]) for k, _ in AGENDA_BUCKETS)
+    events = sum(1 for k, _ in AGENDA_BUCKETS for i in buckets[k] if i.get("type") == "event")
+    tasks = total - events
+    ey, em, ed = plugin.get_ethiopian_date()
 
-    parts.append(f"<h1>{esc(title)}</h1>")
-    parts.append(f"<p><strong>ጠቅላላ የተመዘገቡ፦</strong> {len(items)}</p>")
+    parts = ["<main lang='am'>", "<h1>አጀንዳ</h1>"]
+    parts.append(f"<p><strong>ዛሬ፦</strong> {_html_escape(eth_date_label(plugin, {'ey': ey, 'em': em, 'ed': ed}))}</p>")
+    parts.append(f"<p><strong>ጠቅላላ የተመዘገቡ፦</strong> {total} "
+                 f"(የግል ክንውኖች {events}፣ የዕቅድ ተግባራት {tasks})</p>")
+    parts.append("<nav aria-label='የአጀንዳ ክፍሎች'><ul>"
+                 + "".join(f"<li><a href='#agenda-{k}'>{label} ({len(buckets[k])})</a></li>"
+                           for k, label in AGENDA_BUCKETS)
+                 + "</ul></nav>")
 
-    events = [x for x in items if x.get("type") == "event"]
-    tasks = [x for x in items if x.get("type") != "event"]
+    head = ["ቀን", "ዓይነት", "ነገር", "ዝርዝር", "ሁኔታ", "የአየር ወቅት", "የጾም ወቅት",
+            "የቤተክርስቲያን ዘመን", "ዐቢይ ጾም"]
+    for k, label in AGENDA_BUCKETS:
+        items = buckets[k]
+        parts.append(f"<h2 id='agenda-{k}'>{label} ({len(items)})</h2>")
+        if not items:
+            parts.append("<p>የሚታይ ተግባር የለም።</p>")
+            continue
+        groups = _group_by_month(items)
+        parts.append(_html_month_nav(f"{label} — የወራት ማውጫ", f"agenda-{k}-month", groups, plugin))
+        for n, (key, members) in enumerate(groups):
+            month_label = _month_group_label(plugin, key)
+            if len(groups) > 1:
+                parts.append(f"<h3 id='agenda-{k}-month-{n}'>{_html_escape(month_label)} ({len(members)})</h3>")
+            rows = [[eth_date_label(plugin, t.get("date") or {}),
+                     "ክንውን" if t.get("type") == "event" else (t.get("planName") or "ተግባር"),
+                     t.get("title", ""), t.get("details", ""),
+                     plan_status_label(t.get("status", "")), t.get("climatic", ""),
+                     t.get("fasting", ""), t.get("liturgical", ""),
+                     t.get("greatLentWeek", "")] for t in members]
+            parts.append(_html_table(f"{label} — {month_label}", head, rows))
 
-    if events:
-        parts.append("<h2>የግል ክንውኖች</h2>")
-        parts.append("<ul>")
-        for e in events:
-            d = e.get("date", {})
-            date_label = f"{plugin.get_month_name(d.get('em',''))} {d.get('ed','')} {d.get('ey','')}"
-            parts.append(f"<li>{esc(date_label)} — <strong>{esc(e.get('title',''))}</strong>"
-                         + (f" — {esc(e.get('details',''))}" if e.get("details") else "")
-                         + "</li>")
-        parts.append("</ul>")
+    parts.append("</main>")
+    return "".join(parts)
+
+
+def render_day_agenda_html(plugin, ey, em, ed, day):
+    date_label = eth_date_label(plugin, {"ey": ey, "em": em, "ed": ed})
+    parts = ["<main lang='am'>", f"<h1>{_html_escape(date_label)}</h1>",
+             "<nav aria-label='የቀኑ ክፍሎች'><ul>"
+             "<li><a href='#day-holidays'>በዓላት</a></li>"
+             "<li><a href='#day-synax'>ስንክሳር</a></li>"
+             "<li><a href='#day-gitsawe'>ግጻዌ</a></li>"
+             "<li><a href='#day-season'>ወቅት</a></li>"
+             "<li><a href='#day-events'>የግል ክንውኖች</a></li></ul></nav>"]
+
+    parts.append("<h2 id='day-holidays'>በዓላት</h2>")
+    if day["holidays"]:
+        parts.append("<ul>" + "".join(f"<li>{_html_escape(h)}</li>" for h in day["holidays"]) + "</ul>")
     else:
-        parts.append("<h2>የግል ክንውኖች</h2>")
-        parts.append("<p>ምንም የግል ክንውን አልተመዘገበም።</p>")
+        parts.append("<p>በዚህ ቀን ምንም ብሔራዊ ወይም ሃይማኖታዊ በዓል የለም።</p>")
 
-    if tasks:
-        parts.append("<h2>የዕቅድ ተግባራት</h2>")
-        parts.append("<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;'>")
-        parts.append("<thead><tr>")
-        head = ["ቀን", "ዕቅድ", "ነገር", "ዝርዝር", "ሁኔታ",
-                "የአየር ወቅት", "የጾም ወቅት", "የቤ/ክ ዘመን", "ዐቢይ ጾም"]
-        for h in head:
-            parts.append(f"<th>{esc(h)}</th>")
-        parts.append("</tr></thead><tbody>")
-        for t in tasks:
-            d = t.get("date", {})
-            date_label = f"{plugin.get_month_name(d.get('em',''))} {d.get('ed','')} {d.get('ey','')}"
-            parts.append("<tr>")
-            parts.append(f"<td>{esc(date_label)}</td>")
-            parts.append(f"<td>{esc(t.get('planName',''))}</td>")
-            parts.append(f"<td>{esc(t.get('title',''))}</td>")
-            parts.append(f"<td>{esc(t.get('details',''))}</td>")
-            parts.append(f"<td>{esc(t.get('status',''))}</td>")
-            parts.append(f"<td>{esc(t.get('climatic',''))}</td>")
-            parts.append(f"<td>{esc(t.get('fasting',''))}</td>")
-            parts.append(f"<td>{esc(t.get('liturgical',''))}</td>")
-            parts.append(f"<td>{esc(t.get('greatLentWeek',''))}</td>")
-            parts.append("</tr>")
-        parts.append("</tbody></table>")
+    parts.append("<h2 id='day-synax'>ስንክሳር</h2>")
+    if day["synax_annual"] or day["synax_monthly"]:
+        if day["synax_annual"]:
+            parts.append("<h3>ዓመታዊ በዓላት</h3><ul>"
+                         + "".join(f"<li>{_html_escape(e)}</li>" for e in day["synax_annual"]) + "</ul>")
+        if day["synax_monthly"]:
+            parts.append("<h3>ወርኃዊ በዓላት</h3><ul>"
+                         + "".join(f"<li>{_html_escape(e)}</li>" for e in day["synax_monthly"]) + "</ul>")
     else:
-        parts.append("<h2>የዕቅድ ተግባራት</h2>")
-        parts.append("<p>ምንም የዕቅድ ተግባር አልተመዘገበም።</p>")
+        parts.append("<p>ለዚህ ቀን የስንክሳር መረጃ አልተገኘም።</p>")
 
-    parts.append("</body></html>")
+    parts.append("<h2 id='day-gitsawe'>ግጻዌ</h2>")
+    if day["gitsawe"]:
+        parts.append("<ul>" + "".join(f"<li>{_html_escape(g)}</li>" for g in day["gitsawe"]) + "</ul>")
+    else:
+        parts.append("<p>ለዚህ ቀን የግጻዌ መረጃ አልተገኘም።</p>")
+
+    parts.append("<h2 id='day-season'>ወቅት</h2><ul>")
+    for label, value in day["season"]:
+        parts.append(f"<li>{_html_escape(label)}፦ {_html_escape(value)}</li>")
+    parts.append("</ul>")
+
+    parts.append("<h2 id='day-events'>የግል ክንውኖች</h2>")
+    if day["events"]:
+        parts.append("<ul>" + "".join(
+            f"<li><strong>{_html_escape(e.get('title', ''))}</strong>"
+            + (f" — {_html_escape(e.get('details'))}" if e.get("details") else "") + "</li>"
+            for e in day["events"]) + "</ul>")
+    else:
+        parts.append("<p>ምንም የግል ክንውን የለም።</p>")
+
+    parts.append("</main>")
+    return "".join(parts)
+
+
+def render_gitsawe_structure_html(structure):
+    if not structure or not structure.get("parts"):
+        return "<main lang='am'><p>ምንም ውጤት አልተገኘም።</p></main>"
+
+    def page_range(pages):
+        if isinstance(pages, list) and len(pages) == 2:
+            return f" (ገጽ {_html_escape(pages[0])}–{_html_escape(pages[1])})"
+        return ""
+
+    book = structure.get("book") or {}
+    parts = ["<main lang='am'>", f"<h1>{_html_escape(book.get('title') or 'የመጽሐፉ ማውጫ')}</h1><ol>"]
+    for part in structure["parts"]:
+        parts.append(f"<li><strong>{_html_escape(part.get('title') or '')}</strong>")
+        if part.get("description"):
+            parts.append(f" — {_html_escape(part['description'])}")
+        parts.append(page_range(part.get("printed_pages")))
+        if isinstance(part.get("seasons"), list):
+            parts.append("<ul>")
+            for season in part["seasons"]:
+                parts.append(f"<li>{_html_escape(season.get('season') or '')}<ul>")
+                for m in season.get("months") or []:
+                    parts.append(f"<li>{_html_escape(m.get('month') or '')}{page_range(m.get('printed_pages'))}</li>")
+                parts.append("</ul></li>")
+            parts.append("</ul>")
+        elif isinstance(part.get("sections"), list):
+            parts.append("<ul>" + "".join(f"<li>{_html_escape(s.get('section') or '')}</li>"
+                                          for s in part["sections"]) + "</ul>")
+        elif isinstance(part.get("chapters"), list):
+            parts.append("<ul>" + "".join(
+                f"<li>{_html_escape(c.get('title') or '')}"
+                + (f" — {_html_escape(c['sub'])}" if c.get("sub") else "") + "</li>"
+                for c in part["chapters"]) + "</ul>")
+        parts.append("</li>")
+    parts.append("</ol></main>")
     return "".join(parts)
 
 
 # ============================================================
-# PLANNING DIALOG (keeps editing UI, adds "Show as page" button)
+# SHARED DIALOG HELPERS
 # ============================================================
+def _add_date_fields(helper, prefix, year_suffix=""):
+    year = helper.addLabeledControl(f"{prefix}ዓመት{year_suffix}፦", wx.SpinCtrl, min=1, max=9999)
+    month = helper.addLabeledControl(f"{prefix}ወር፦", wx.Choice, choices=MONTHS[1:])
+    day = helper.addLabeledControl(f"{prefix}ቀን፦", wx.SpinCtrl, min=1, max=30)
+    return year, month, day
+
+
+def _set_date_fields(year, month, day, ey, em, ed):
+    year.SetValue(ey)
+    month.SetSelection(em - 1)
+    day.SetValue(ed)
+
+
+def _get_date_fields(year, month, day):
+    return {'ey': year.GetValue(), 'em': max(0, month.GetSelection()) + 1, 'ed': day.GetValue()}
+
+
+def _button_row(parent, specs):
+    row = wx.BoxSizer(wx.HORIZONTAL)
+    for label, handler in specs:
+        b = wx.Button(parent, label=label)
+        b.Bind(wx.EVT_BUTTON, handler)
+        row.Add(b, 0, wx.ALL, 2)
+    return row
+
+
+class DateChoiceDialog(wx.Dialog):
+    def __init__(self, parent, plugin, title, ey, em, ed, with_year=True):
+        super().__init__(parent, title=title)
+        self.plugin = plugin
+        h = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
+        self.y = h.addLabeledControl("ዓመት፦", wx.SpinCtrl, min=1, max=9999) if with_year else None
+        self.m = h.addLabeledControl("ወር፦", wx.Choice, choices=MONTHS[1:])
+        self.d = h.addLabeledControl("ቀን፦", wx.SpinCtrl, min=1, max=30)
+        h.addItem(self.CreateButtonSizer(wx.OK | wx.CANCEL))
+        if self.y is not None:
+            self.y.SetValue(ey)
+        self.m.SetSelection(em - 1)
+        self.d.SetValue(ed)
+        self.ey = ey
+        self.Bind(wx.EVT_BUTTON, self.on_ok, id=wx.ID_OK)
+        self.SetSizerAndFit(h.sizer)
+        self.CentreOnScreen()
+        (self.y or self.m).SetFocus()
+
+    def date(self):
+        ey = self.y.GetValue() if self.y is not None else self.ey
+        return ey, max(0, self.m.GetSelection()) + 1, self.d.GetValue()
+
+    def on_ok(self, event):
+        ey, em, ed = self.date()
+        limit = self.plugin.get_month_length(ey, em) if self.y is not None else (6 if em == 13 else 30)
+        if ed > limit:
+            wx.MessageBox(f"{self.plugin.get_month_name(em)} {limit} ቀናት ብቻ አሉት።",
+                          "ስህተት", wx.OK | wx.ICON_ERROR, self)
+            self.d.SetFocus()
+            return
+        event.Skip()
+
+
+# ============================================================
+# PLANNING DIALOG
+# ============================================================
+class PlanDayDialog(wx.Dialog):
+    def __init__(self, parent, plugin, row):
+        super().__init__(parent, title="የዕቅድ ቀን አርም")
+        h = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
+        h.addItem(wx.StaticText(self, label=eth_date_label(plugin, row['date'])))
+        self.title = h.addLabeledControl("ነገር፦", wx.TextCtrl)
+        self.details = h.addLabeledControl("ዝርዝር፦", wx.TextCtrl)
+        self.status = h.addLabeledControl("ሁኔታ፦", wx.Choice,
+                                          choices=[PLAN_STATUS_LABELS[k] for k in PLAN_STATUS_KEYS])
+        key = row.get('status', 'planned')
+        self.status.SetSelection(PLAN_STATUS_KEYS.index(key) if key in PLAN_STATUS_KEYS else 0)
+        self.title.SetValue(row.get('title', ''))
+        self.details.SetValue(row.get('details', ''))
+        h.addItem(self.CreateButtonSizer(wx.OK | wx.CANCEL))
+        self.SetSizerAndFit(h.sizer)
+        self.CentreOnScreen()
+        self.title.SetFocus()
+
+    def status_key(self):
+        return PLAN_STATUS_KEYS[max(0, self.status.GetSelection())]
+
+
 class PlanningDialog(wx.Dialog):
     def __init__(self, parent, plugin):
         super().__init__(parent, title="የኢትዮጵያ ዕቅድ")
         self.plugin = plugin
-        self.plan = None
-        self.rows = []
+        self.action = None
+        self.next_edit = 0
+        draft = getattr(plugin, "planning_draft", None)
+        self.plan = draft
+        self.rows = draft.get("rows", []) if draft else []
+
         helper = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
         self.name = helper.addLabeledControl("የዕቅድ ስም፦", wx.TextCtrl)
-        row = wx.BoxSizer(wx.HORIZONTAL)
-        self.sy = wx.SpinCtrl(self, min=1, max=9999)
-        self.sm = wx.SpinCtrl(self, min=1, max=13)
-        self.sd = wx.SpinCtrl(self, min=1, max=30)
-        for label, ctrl in (("መጀመሪያ ዓመት", self.sy), ("ወር", self.sm), ("ቀን", self.sd)):
-            row.Add(wx.StaticText(self, label=label), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-            row.Add(ctrl, 0, wx.ALL, 4)
-        helper.addItem(row)
-        prow = wx.BoxSizer(wx.HORIZONTAL)
-        self.period = wx.SpinCtrl(self, min=1, max=9999, initial=1)
-        self.periodUnit = wx.Choice(self, choices=["ቀን", "ሳምንት", "ወር", "ዓመት", "የተወሰነ የቀን ክልል"])
+        self.sy, self.sm, self.sd = _add_date_fields(helper, "መጀመሪያ ")
+        self.period = helper.addLabeledControl("የዕቅድ ጊዜ ብዛት፦", wx.SpinCtrl, min=1, max=9999, initial=1)
+        self.periodUnit = helper.addLabeledControl(
+            "የዕቅድ ጊዜ ክፍል፦", wx.Choice,
+            choices=["ቀን", "ሳምንት", "ወር", "ዓመት", "የተወሰነ የቀን ክልል"])
         self.periodUnit.SetSelection(2)
-        self.interval = wx.SpinCtrl(self, min=1, max=9999, initial=1)
-        self.intervalUnit = wx.Choice(self, choices=["ቀን", "ሳምንት", "ወር", "ዓመት"])
+        self.ey, self.em, self.ed = _add_date_fields(helper, "መጨረሻ ", " (ለተወሰነ የቀን ክልል ብቻ)")
+        self.interval = helper.addLabeledControl("የድግግሞሽ ክፍተት ብዛት፦", wx.SpinCtrl, min=1, max=9999, initial=1)
+        self.intervalUnit = helper.addLabeledControl("የድግግሞሽ ክፍተት ክፍል፦", wx.Choice,
+                                                     choices=["ቀን", "ሳምንት", "ወር", "ዓመት"])
         self.intervalUnit.SetSelection(0)
-        for label, ctrl in (("የዕቅድ ጊዜ", self.period), ("ክፍል", self.periodUnit),
-                            ("በየ", self.interval), ("ክፍል", self.intervalUnit)):
-            prow.Add(wx.StaticText(self, label=label), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-            prow.Add(ctrl, 0, wx.ALL, 4)
-        helper.addItem(prow)
-        erow = wx.BoxSizer(wx.HORIZONTAL)
-        self.ey = wx.SpinCtrl(self, min=1, max=9999)
-        self.em = wx.SpinCtrl(self, min=1, max=13)
-        self.ed = wx.SpinCtrl(self, min=1, max=30)
-        for label, ctrl in (("መጨረሻ ዓመት", self.ey), ("ወር", self.em), ("ቀን", self.ed)):
-            erow.Add(wx.StaticText(self, label=label), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-            erow.Add(ctrl, 0, wx.ALL, 4)
-        self.endBox = wx.StaticBoxSizer(wx.StaticBox(self, label="የተወሰነ የመጨረሻ ቀን"), wx.HORIZONTAL)
-        self.endBox.Add(erow, 1, wx.EXPAND)
-        helper.addItem(self.endBox)
-        srow = wx.BoxSizer(wx.HORIZONTAL)
-        self.seasonFamily = wx.Choice(self, choices=["ሁሉም ቀናት", "ምንም", "የአየር ወቅት", "የጾም ወቅት",
-                                                     "የቤተክርስቲያን ዘመን", "የዐቢይ ጾም ሳምንት"])
+        self.seasonFamily = helper.addLabeledControl(
+            "የወቅት ቤተሰብ፦", wx.Choice, choices=[PLAN_FAMILY_LABELS[k] for k in PLAN_FAMILY_KEYS])
         self.seasonFamily.SetSelection(0)
-        self.season = wx.Choice(self, choices=["ሁሉም"])
-        self.season.SetSelection(0)
-        srow.Add(wx.StaticText(self, label="የወቅት ቤተሰብ"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-        srow.Add(self.seasonFamily, 1, wx.ALL, 4)
-        srow.Add(self.season, 2, wx.ALL, 4)
-        helper.addItem(srow)
+        self.season = helper.addLabeledControl("የተመረጠ ወቅት፦", wx.Choice)
+        self.fill_seasons()
+        saved_columns = getattr(plugin, "planning_columns", None) or {}
+        self.columnChecks = {}
+        for key, field, label in PLAN_COLUMNS:
+            cb = wx.CheckBox(self, label=f"{label} አምድ በሠንጠረዡ ላይ አሳይ")
+            cb.SetValue(bool(saved_columns.get(key, True)))
+            helper.addItem(cb)
+            self.columnChecks[key] = cb
+
+        helper.addItem(_button_row(self, [
+            ("ዕቅድ አስላ", self.generate),
+            ("አጽዳ", self.clear),
+            ("ውጤቱን በመስኮት አሳይ", self.show_page),
+            ("ቀን አርም", self.edit_day),
+            ("አስቀምጥ", self.save),
+            ("የተቀመጠ ዕቅድ ጫን", self.load_saved),
+            ("ከፋይል አስገባ", self.import_file),
+        ]))
+        export_row = _button_row(self, [
+            ("ወደ CSV ላክ", lambda e: self.export('csv')),
+            ("ወደ TSV ላክ", lambda e: self.export('tsv')),
+            ("ወደ JSON ላክ", lambda e: self.export('json')),
+            ("ወደ Markdown ላክ", lambda e: self.export('md')),
+            ("ወደ HTML ላክ", lambda e: self.export('html')),
+            ("ወደ iCal ላክ", self.export_ical),
+        ])
+        close = wx.Button(self, wx.ID_CANCEL, label="ዝጋ")
+        export_row.Add(close, 0, wx.ALL, 2)
+        helper.addItem(export_row)
         self.status = wx.StaticText(self, label="")
         helper.addItem(self.status)
-        self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        helper.addItem(self.list, proportion=1, flag=wx.EXPAND)
-        for col, label, width in [(0, "ቀን", 150), (1, "የአየር ወቅት", 150), (2, "የጾም ወቅት", 180),
-                                   (3, "የቤ/ክ ዘመን", 180), (4, "ዐቢይ ጾም", 150), (5, "ዕቅድ ነገር", 180),
-                                   (6, "ዝርዝር", 250), (7, "ሁኔታ", 120)]:
-            self.list.InsertColumn(col, label, width=width)
-        edit = wx.BoxSizer(wx.HORIZONTAL)
-        self.title = wx.TextCtrl(self)
-        self.details = wx.TextCtrl(self)
-        self.statusChoice = wx.Choice(self, choices=["planned", "in-progress", "done", "skipped"])
-        self.statusChoice.SetSelection(0)
-        edit.Add(wx.StaticText(self, label="ነገር"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-        edit.Add(self.title, 1, wx.ALL, 4)
-        edit.Add(wx.StaticText(self, label="ዝርዝር"), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-        edit.Add(self.details, 2, wx.ALL, 4)
-        edit.Add(self.statusChoice, 0, wx.ALL, 4)
-        helper.addItem(edit)
-        btn = wx.BoxSizer(wx.HORIZONTAL)
-        for label, handler in [("ዕቅድ አስላ", self.generate),
-                                ("ውጤቱን በመስኮት አሳይ", self.show_page),
-                                ("አስቀምጥ", self.save),
-                                ("ጫን የተቀመጠ", self.load_saved),
-                                ("ከፋይል አስገባ", self.import_file),
-                                ("CSV", lambda e: self.export('csv')),
-                                ("TSV", lambda e: self.export('tsv')),
-                                ("JSON", lambda e: self.export('json')),
-                                ("Markdown", lambda e: self.export('md')),
-                                ("HTML", lambda e: self.export('html')),
-                                ("iCal", self.export_ical),
-                                ("ዝጋ", lambda e: self.EndModal(wx.ID_CANCEL))]:
-            b = wx.Button(self, label=label)
-            b.Bind(wx.EVT_BUTTON, handler)
-            btn.Add(b, 0, wx.ALL, 2)
-        helper.addItem(btn)
-        self.SetSize((1150, 700))
-        self.CentreOnScreen()
-        ey, em, ed = plugin.get_ethiopian_date()
-        self.sy.SetValue(ey); self.sm.SetValue(em); self.sd.SetValue(ed)
-        self.ey.SetValue(ey); self.em.SetValue(em); self.ed.SetValue(ed)
-        self.periodUnit.Bind(wx.EVT_CHOICE, lambda e: self.toggle_end())
-        self.seasonFamily.Bind(wx.EVT_CHOICE, lambda e: self.fill_seasons())
-        self.list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.select_row)
-        self.toggle_end()
-        self.fill_seasons()
 
-    def toggle_end(self):
-        self.endBox.Show(self.periodUnit.GetSelection() == 4)
-        self.Layout()
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(helper.sizer, 1, wx.EXPAND | wx.ALL, guiHelper.BORDER_FOR_DIALOGS)
+        self.SetSizerAndFit(outer)
+        self.CentreOnScreen()
+
+        ey, em, ed = plugin.get_ethiopian_date()
+        _set_date_fields(self.sy, self.sm, self.sd, ey, em, ed)
+        _set_date_fields(self.ey, self.em, self.ed, ey, em, ed)
+        if draft:
+            self.populate(draft)
+            self.status.SetLabel(f"የቀድሞ ዕቅድ፦ {len(self.rows)} ቀናት።")
+        self.seasonFamily.Bind(wx.EVT_CHOICE, lambda e: self.on_family())
+        self.name.SetFocus()
+
+    def say(self, text):
+        self.status.SetLabel(text)
+        ui.message(text)
 
     def unit(self, sel):
         return ['day', 'week', 'month', 'year', 'custom'][sel]
 
     def family(self, sel):
-        return ['all', 'none', 'climatic', 'fasting', 'liturgical', 'lent-week'][sel]
+        return PLAN_FAMILY_KEYS[sel]
 
     def fill_seasons(self):
         self.season.Clear()
         self.season.Append('ሁሉም', 'all')
-        cat = self.family(self.seasonFamily.GetSelection())
-        if cat == 'none':
-            return
-        catalogs = {
-            'climatic': [('autumn', 'መፀው (Autumn)'), ('summer', 'በጋ (Summer)'),
-                         ('spring', 'በልግ (Spring)'), ('winter', 'ክረምት (Winter)')],
-            'fasting': [('none', 'የአጽዋም ዘመን አይደለም'), ('abiy', 'ዐቢይ ጾም'),
-                        ('nebiyat', 'ጾመ ነቢያት'), ('filseta', 'ጾመ ፍልሰታ'),
-                        ('hawaryat', 'ጾመ ሐዋርያት'), ('nenewe', 'ጾመ ነነዌ'),
-                        ('gehad', 'ጾመ ገሀድ'), ('hamsa', 'ኀምሳ ዕለት'), ('dihnet', 'ጾመ ድኅነት')],
-            'liturgical': [(x, x) for x in ['ዘመነ ዮሐንስ', 'ዘካርያስ', 'ዘመነ ፍሬ', 'ዘመነ መስቀል',
-                                             'ዘመነ ጽጌ', 'ዘመነ አስተምሕሮ', 'ዘመነ ስብከት',
-                                             'ዘመነ ብርሃን', 'ዘመነ ኖላዊ', 'ዘመነ መርዓዊ',
-                                             'አማኑኤል', 'ዘመነ ልደት', 'ናዝሬት', 'ገሐድ',
-                                             'ዘመነ ጥምቀት', 'ዘመነ ነነዌ', 'ዘመነ ጾም',
-                                             'ዘመነ ትንሣኤ', 'ዘመነ ዕርገት', 'ዘመነ ጰራቅሊጦስ',
-                                             'ደመና፣ ዘርዕ፣ ዝናም', 'መብረቅ፣ ባሕር',
-                                             'ዐይነ ኵሉ፣ ዕጕለ ቋዓት', 'ጎሕ፣ ነግሽ']],
-            'lent-week': list(zip(GREAT_LENT_WEEK_KEYS, GREAT_LENT_WEEK_NAMES_AM))
-        }
-        for k, label in catalogs.get(cat, []):
+        for k, label in PLAN_SEASON_CATALOGS.get(self.family(self.seasonFamily.GetSelection()), []):
             self.season.Append(label, k)
         self.season.SetSelection(0)
 
-    def season_info(self, d):
-        meta = self.plugin.calculate_bahre_hasab(d['ey'])
-        feasts = self.plugin.calculate_movable_feasts(meta['MebajaHamer'], meta['Metqe'])
-        wk = self.plugin.get_great_lent_week(self.plugin.ethiopian_day_of_year(d['em'], d['ed']), feasts)
-        return {
-            'climatic': self.plugin.get_climatic_season(d['em'], d['ed']),
-            'fasting': self.plugin.get_fasting_season(d['ey'], d['em'], d['ed'], meta, feasts),
-            'liturgical': self.plugin.get_liturgical_season(d['ey'], d['em'], d['ed'], meta, feasts),
-            'greatLentWeek': self.plugin.get_great_lent_week_name(wk) if wk else ''
-        }
+    def on_family(self):
+        self.fill_seasons()
+        if self.family(self.seasonFamily.GetSelection()) == 'none':
+            for cb in self.columnChecks.values():
+                cb.SetValue(False)
 
-    def add_unit(self, d, n, u):
-        if u in ('day', 'week'):
-            days = n if u == 'day' else n * 7
-            y, m, day = self.plugin.jdn_to_ethiopian(self.plugin.ethiopian_to_jdn(**d) + days)
-            return {'ey': y, 'em': m, 'ed': day}
-        if u == 'month':
-            return self.plugin._planning_add_months(d, n)
-        if u == 'year':
-            return self.plugin._planning_add_years(d, n)
-        raise ValueError('Unsupported interval unit.')
+    def columns(self):
+        return {key: cb.GetValue() for key, cb in self.columnChecks.items()}
+
+    def populate(self, p):
+        try:
+            self.name.SetValue(p.get('name') or 'Ethiopian Plan')
+            st = p.get('start')
+            if st:
+                _set_date_fields(self.sy, self.sm, self.sd, st['ey'], st['em'], st['ed'])
+            self.period.SetValue(int(p.get('periodValue') or 1))
+            units = ['day', 'week', 'month', 'year', 'custom']
+            unit = p.get('periodUnit') or 'month'
+            self.periodUnit.SetSelection(units.index(unit) if unit in units else 2)
+            end = p.get('endDate')
+            if unit == 'custom' and end:
+                _set_date_fields(self.ey, self.em, self.ed, end['ey'], end['em'], end['ed'])
+            self.interval.SetValue(int(p.get('intervalValue') or 1))
+            iunit = p.get('intervalUnit') or 'day'
+            self.intervalUnit.SetSelection(units.index(iunit) if iunit in units[:4] else 0)
+            fam = p.get('seasonCategory') or 'all'
+            self.seasonFamily.SetSelection(PLAN_FAMILY_KEYS.index(fam) if fam in PLAN_FAMILY_KEYS else 0)
+            self.fill_seasons()
+            ids = [k for k, _ in PLAN_SEASON_CATALOGS.get(fam, [])]
+            sid = p.get('seasonId') or 'all'
+            if sid in ids:
+                self.season.SetSelection(ids.index(sid) + 1)
+        except Exception:
+            logHandler.log.error("Plan form restore failed", exc_info=True)
+
+    def clear(self, event=None):
+        self.plan = None
+        self.rows = []
+        self.next_edit = 0
+        self.plugin.planning_draft = None
+        ey, em, ed = self.plugin.get_ethiopian_date()
+        _set_date_fields(self.sy, self.sm, self.sd, ey, em, ed)
+        self.seasonFamily.SetSelection(0)
+        self.fill_seasons()
+        for cb in self.columnChecks.values():
+            cb.SetValue(True)
+        self.say("ተጠርጓል።")
+
+    def commit(self):
+        if self.plan is None:
+            return
+        self.plan['name'] = self.name.GetValue().strip() or 'Ethiopian Plan'
+        self.plan['rows'] = self.rows
+        self.plugin.planning_draft = self.plan
+        self.plugin.planning_columns = self.columns()
 
     def generate(self, event=None):
         try:
-            start = {'ey': self.sy.GetValue(), 'em': self.sm.GetValue(), 'ed': self.sd.GetValue()}
-            if start['ed'] > self.plugin.get_month_length(start['ey'], start['em']):
-                raise ValueError('የመጀመሪያ ቀን ልክ አይደለም።')
             unit = self.unit(self.periodUnit.GetSelection())
             fam = self.family(self.seasonFamily.GetSelection())
             sid = self.season.GetClientData(self.season.GetSelection()) or 'all'
-            if unit == 'custom':
-                end = {'ey': self.ey.GetValue(), 'em': self.em.GetValue(), 'ed': self.ed.GetValue()}
-                endj = self.plugin.ethiopian_to_jdn(**end) + 1
+            end = _get_date_fields(self.ey, self.em, self.ed) if unit == 'custom' else None
+            ui.message("በማስላት ላይ።")
+            self.plan = self.plugin.generate_plan(
+                self.name.GetValue().strip(), _get_date_fields(self.sy, self.sm, self.sd),
+                self.period.GetValue(), unit, self.interval.GetValue(),
+                self.unit(self.intervalUnit.GetSelection()), fam, sid, end)
+            self.rows = self.plan['rows']
+            self.next_edit = 0
+            self.commit()
+            if self.rows:
+                self.say(f"ዕቅድ፦ {len(self.rows)} ቀናት። «ውጤቱን በመስኮት አሳይ» ወይም «ቀን አርም» ይጫኑ።")
             else:
-                end = self.add_unit(start, self.period.GetValue(), unit)
-                endj = self.plugin.ethiopian_to_jdn(**end)
-            rows = []
-            cur = start.copy()
-            guard = 0
-            while self.plugin.ethiopian_to_jdn(**cur) < endj and guard < 5000:
-                info = self.season_info(cur)
-                ok = True
-                if fam == 'climatic':
-                    ok = info['climatic'] == self.season.GetString(self.season.GetSelection())
-                elif fam == 'fasting':
-                    lab = self.season.GetString(self.season.GetSelection())
-                    ok = (info['fasting'] == lab if sid == 'none' else lab in info['fasting'])
-                elif fam == 'liturgical':
-                    ok = info['liturgical'] == self.season.GetString(self.season.GetSelection())
-                elif fam == 'lent-week':
-                    ok = info['greatLentWeek'] == self.season.GetString(self.season.GetSelection())
-                if fam == 'none':
-                    ok = True
-                if ok:
-                    rows.append({'id': f"{cur['ey']}-{cur['em']}-{cur['ed']}", 'date': cur.copy(),
-                                 'season': info, 'title': '', 'details': '', 'status': 'planned'})
-                nxt = self.add_unit(cur, self.interval.GetValue(), self.unit(self.intervalUnit.GetSelection()))
-                if self.plugin.ethiopian_to_jdn(**nxt) <= self.plugin.ethiopian_to_jdn(**cur):
-                    raise ValueError('የክፍሉ ጊዜ ዕቅዱን አያራምድም።')
-                cur = nxt
-                guard += 1
-            if guard >= 5000:
-                raise ValueError('ዕቅዱ በጣም ትልቅ ነው።')
-            self.plan = {'id': datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'),
-                         'name': self.name.GetValue().strip() or 'Ethiopian Plan',
-                         'start': start,
-                         'periodMode': 'date-range' if unit == 'custom' else 'duration',
-                         'periodValue': self.period.GetValue(), 'periodUnit': unit,
-                         'intervalValue': self.interval.GetValue(),
-                         'intervalUnit': self.unit(self.intervalUnit.GetSelection()),
-                         'seasonCategory': fam, 'seasonId': sid, 'rows': rows}
-            if unit == 'custom':
-                self.plan['endDate'] = end
-            self.rows = rows
-            self.refresh_list()
-            self.status.SetLabel(f"ዕቅድ፦ {len(rows)} ቀናት — «ውጤቱን በመስኮት አሳይ» ይጫኑ።")
+                self.say("ምንም ቀን አልተገኘም። የወቅት ማጣሪያውን ወይም የዕቅድ ጊዜውን ይቀይሩ።")
         except Exception as e:
-            self.status.SetLabel(f"ስህተት፦ {e}")
+            self.say(f"ስህተት፦ {e}")
 
-    def refresh_list(self):
-        self.list.DeleteAllItems()
-        for r in self.rows:
-            d = r['date']
-            vals = [f"{self.plugin.get_month_name(d['em'])} {d['ed']} {d['ey']}",
-                    r['season'].get('climatic', ''), r['season'].get('fasting', ''),
-                    r['season'].get('liturgical', ''), r['season'].get('greatLentWeek', ''),
-                    r.get('title', ''), r.get('details', ''), r.get('status', 'planned')]
-            i = self.list.InsertItem(self.list.GetItemCount(), vals[0])
-            for c, v in enumerate(vals[1:], 1):
-                self.list.SetItem(i, c, str(v or ''))
-
-    def select_row(self, event):
-        i = event.GetIndex()
-        if 0 <= i < len(self.rows):
-            r = self.rows[i]
-            self.title.SetValue(r.get('title', ''))
-            self.details.SetValue(r.get('details', ''))
-            self.statusChoice.SetStringSelection(r.get('status', 'planned'))
-            self.title.Bind(wx.EVT_TEXT, self._row_change)
-            self.details.Bind(wx.EVT_TEXT, self._row_change)
-            self.statusChoice.Bind(wx.EVT_CHOICE, self._row_change)
-
-    def _row_change(self, event):
-        i = self.list.GetFirstSelected()
-        if i < 0 or i >= len(self.rows):
+    def edit_day(self, event=None):
+        if not self.rows:
+            self.say('መጀመሪያ ዕቅድ ያስሉ።')
             return
-        r = self.rows[i]
-        r['title'] = self.title.GetValue()
-        r['details'] = self.details.GetValue()
-        r['status'] = self.statusChoice.GetStringSelection()
-        self.refresh_list()
-        self.list.Select(i)
+        choices = []
+        for n, r in enumerate(self.rows, 1):
+            line = f"{n}. {eth_date_label(self.plugin, r['date'])}"
+            if r.get('title'):
+                line += f" — {r['title']}"
+            choices.append(f"{line} ({plan_status_label(r.get('status', 'planned'))})")
+        pick = wx.SingleChoiceDialog(self, 'የሚያርሙትን ቀን ይምረጡ፣', 'ቀን አርም', choices)
+        pick.SetSelection(min(self.next_edit, len(choices) - 1))
+        if pick.ShowModal() != wx.ID_OK:
+            pick.Destroy()
+            return
+        i = pick.GetSelection()
+        pick.Destroy()
+        row = self.rows[i]
+        dlg = PlanDayDialog(self, self.plugin, row)
+        if dlg.ShowModal() == wx.ID_OK:
+            row['title'] = dlg.title.GetValue().strip()
+            row['details'] = dlg.details.GetValue().strip()
+            row['status'] = dlg.status_key()
+            self.next_edit = i + 1
+            self.commit()
+            self.say(f"ተቀምጧል፦ {eth_date_label(self.plugin, row['date'])}")
+        dlg.Destroy()
 
     def save(self, event=None):
         if not self.plan:
+            self.say('መጀመሪያ ዕቅድ ያስሉ።')
             return
-        self.plan['name'] = self.name.GetValue().strip() or 'Ethiopian Plan'
+        self.commit()
         existing = self.plugin._load_plans()
         if any(str(p.get('id')) == str(self.plan.get('id')) for p in existing):
             existing = [self.plan if str(p.get('id')) == str(self.plan.get('id')) else p for p in existing]
         else:
             existing = existing + [self.plan]
         self.plugin._save_plans(existing)
-        self.status.SetLabel('ዕቅዱ ተቀምጧል።')
+        self.say('ዕቅዱ ተቀምጧል።')
 
     def load_saved(self, event=None):
         plans = self.plugin._load_plans()
         if not plans:
-            self.status.SetLabel('የተቀመጠ ዕቅድ የለም።')
+            self.say('የተቀመጠ ዕቅድ የለም።')
             return
         dlg = wx.SingleChoiceDialog(self, 'የተቀመጠ ዕቅድ ይምረጡ፣', 'ዕቅድ ጫን',
-                                     [p.get('name', 'Ethiopian Plan') for p in plans])
+                                     [f"{p.get('name', 'Ethiopian Plan')} ({len(p.get('rows', []))} ቀናት)"
+                                      for p in plans])
         if dlg.ShowModal() == wx.ID_OK:
-            p = plans[dlg.GetSelection()]
-            self.plan = p
-            self.rows = p.get('rows', [])
-            self.name.SetValue(p.get('name', ''))
-            self.refresh_list()
-            self.status.SetLabel(f"{len(self.rows)} ቀናት ተጫነ።")
+            self.plan = plans[dlg.GetSelection()]
+            self.rows = self.plan.get('rows', [])
+            self.next_edit = 0
+            self.populate(self.plan)
+            self.commit()
+            self.say(f"{len(self.rows)} ቀናት ተጫነ።")
         dlg.Destroy()
 
     def import_file(self, event=None):
@@ -1238,171 +1448,205 @@ class PlanningDialog(wx.Dialog):
         path = dlg.GetPath()
         dlg.Destroy()
         try:
-            text = open(path, 'r', encoding='utf-8-sig').read()
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                text = f.read()
             ext = Path(path).suffix.lower()[1:]
             self.plan = self.plugin._planning_import_text(text, ext)
             self.rows = self.plan['rows']
-            self.name.SetValue(self.plan.get('name', 'Imported Ethiopian Plan'))
-            self.refresh_list()
-            self.status.SetLabel('ዕቅዱ ተጫነ።')
+            self.next_edit = 0
+            self.populate(self.plan)
+            self.commit()
+            self.say(f"ዕቅዱ ተጫነ። {len(self.rows)} ቀናት።")
         except Exception as e:
-            self.status.SetLabel(f'ስህተት፦ {e}')
+            self.say(f'ስህተት፦ {e}')
 
     def export(self, fmt):
         if not self.plan:
-            self.status.SetLabel('መጀመሪያ ዕቅድ ያስሉ።')
+            self.say('መጀመሪያ ዕቅድ ያስሉ።')
             return
-        self.plan['name'] = self.name.GetValue().strip() or 'Ethiopian Plan'
-        self.plan['rows'] = self.rows
+        self.commit()
         self.plugin._export_file(self.plugin._planning_export_text(self.plan, fmt),
                                   f"{self.plugin._safe_filename(self.plan['name'])}.{fmt}",
-                                  self.plugin._mime(fmt))
+                                  self.plugin._mime(fmt), self)
 
     def export_ical(self, event=None):
         if not self.plan:
-            self.status.SetLabel('መጀመሪያ ዕቅድ ያስሉ።')
+            self.say('መጀመሪያ ዕቅድ ያስሉ።')
             return
-        self.plan['rows'] = self.rows
-        self.plugin._export_file(self.plugin._build_ical(self.rows, self.plan.get('name', 'Ethiopian Plan'), 'plan'),
-                                  f"{self.plugin._safe_filename(self.plan.get('name', 'ethiopian-plan'))}.ics",
-                                  'text/calendar')
+        self.commit()
+        self.plugin._export_file(self.plugin._build_plan_ical(self.plan),
+                                  f"{self.plugin._safe_filename(self.plan['name'])}.ics",
+                                  'text/calendar', self)
 
     def show_page(self, event=None):
-        """Open the currently-generated plan as a navigable HTML page."""
         if not self.rows:
-            self.status.SetLabel("መጀመሪያ ዕቅድ ያስሉ።")
+            self.say("መጀመሪያ ዕቅድ ያስሉ።")
             return
-        plan = dict(self.plan or {})
-        plan["rows"] = self.rows
-        plan["name"] = self.name.GetValue().strip() or plan.get("name", "Ethiopian Plan")
-        html = render_plan_html(self.plugin, plan)
-        self.plugin.show_html(plan["name"], html)
-        ui.message(f"ዕቅዱ በመስኮት ተከፍቷል። {len(self.rows)} ቀናት። በርዕስ ለመዘዋወር H ይጠቀሙ።")
+        self.commit()
+        self.action = 'page'
+        self.EndModal(wx.ID_OK)
 
 
 # ============================================================
-# AGENDA — launcher + add-event dialog + HTML page
+# AGENDA — launcher + add-event dialog
 # ============================================================
 class AddAgendaEventDialog(wx.Dialog):
-    """Small dialog to log one personal event."""
     def __init__(self, parent, plugin, ey, em, ed):
         super().__init__(parent, title="የግል ክንውን ጨምር")
         self.plugin = plugin
         h = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
-
-        row = wx.BoxSizer(wx.HORIZONTAL)
-        self.y = wx.SpinCtrl(self, min=1, max=9999)
-        self.m = wx.SpinCtrl(self, min=1, max=13)
-        self.d = wx.SpinCtrl(self, min=1, max=30)
-        for label, c in [('ዓመት', self.y), ('ወር', self.m), ('ቀን', self.d)]:
-            row.Add(wx.StaticText(self, label=label), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 4)
-            row.Add(c, 0, wx.ALL, 4)
-        h.addItem(row)
-
         self.title = h.addLabeledControl("ስም፦", wx.TextCtrl)
         self.details = h.addLabeledControl("ዝርዝር፦", wx.TextCtrl)
-
+        self.y, self.m, self.d = _add_date_fields(h, "የክንውን ")
         h.addItem(self.CreateButtonSizer(wx.OK | wx.CANCEL))
-
-        self.y.SetValue(ey); self.m.SetValue(em); self.d.SetValue(ed)
+        _set_date_fields(self.y, self.m, self.d, ey, em, ed)
+        self.Bind(wx.EVT_BUTTON, self.on_ok, id=wx.ID_OK)
         self.SetSizerAndFit(h.sizer)
         self.CentreOnScreen()
         self.title.SetFocus()
 
+    def date(self):
+        return _get_date_fields(self.y, self.m, self.d)
+
+    def on_ok(self, event):
+        if not self.title.GetValue().strip():
+            wx.MessageBox("ስም ማስገባት ያስፈልጋል።", "ስህተት", wx.OK | wx.ICON_ERROR, self)
+            self.title.SetFocus()
+            return
+        d = self.date()
+        limit = self.plugin.get_month_length(d['ey'], d['em'])
+        if d['ed'] > limit:
+            wx.MessageBox(f"{self.plugin.get_month_name(d['em'])} {limit} ቀናት ብቻ አሉት።",
+                          "ስህተት", wx.OK | wx.ICON_ERROR, self)
+            self.d.SetFocus()
+            return
+        event.Skip()
+
 
 class AgendaDialog(wx.Dialog):
-    """
-    Launcher dialog for the agenda.
-
-    The agenda itself is presented as a navigable HTML page via
-    `show_html()`. This dialog only gathers the options and the
-    'add personal event' workflow.
-    """
     def __init__(self, parent, plugin):
         super().__init__(parent, title="አጀንዳ")
         self.plugin = plugin
+        self.action = None
+        self.show_done = False
+        self.day_date = None
         h = guiHelper.BoxSizerHelper(self, orientation=wx.VERTICAL)
 
-        intro = wx.StaticText(
-            self,
-            label="አጀንዳውን በአሳሽ መስኮት (HTML) ያሳያል። በርዕስ ለመዘዋወር H ይጠቀሙ።"
-        )
-        intro.SetName("መግለጫ")
-        h.addItem(intro)
+        h.addItem(wx.StaticText(
+            self, label="«አጀንዳ አሳይ» አጀንዳውን በአሳሽ መስኮት ይከፍታል። በርዕስ ለመዘዋወር H፣ ለሠንጠረዥ T ይጠቀሙ።"))
 
         self.showdone = wx.CheckBox(self, label="የተጠናቀቁና የተዘለሉትን አሳይ")
         self.showdone.SetValue(False)
-        self.showdone.SetName("የተጠናቀቁ ተግባራት አሳይ")
         h.addItem(self.showdone)
 
-        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        h.addItem(_button_row(self, [
+            ("&አጀንዳ አሳይ", self.show_agenda_page),
+            ("&የቀን አጀንዳ", self.show_day_agenda),
+            ("የግል ክንውን &ጨምር", self.add_event),
+        ]))
+        h.addItem(_button_row(self, [
+            ("የተግባር &ሁኔታ ቀይር", self.change_status),
+            ("አንድ ክንውን አ&ጥፋ", self.delete_event),
+            ("ሁሉንም ክንውኖች አጥፋ", self.clear_events),
+        ]))
 
-        self.btn_show = wx.Button(self, label="&አጀንዳ አሳይ")
-        self.btn_show.SetName("አጀንዳ አሳይ")
-        self.btn_show.SetHelpText("አጀንዳውን በሚነበብ መስኮት ይከፍታል።")
-        self.btn_show.Bind(wx.EVT_BUTTON, self.show_agenda_page)
-        btn_row.Add(self.btn_show, 0, wx.ALL, 4)
-
-        self.btn_add = wx.Button(self, label="የግል ክንውን &ጨምር")
-        self.btn_add.SetName("የግል ክንውን ጨምር")
-        self.btn_add.SetHelpText("አዲስ የግል ክንውን ለመመዝገብ ይከፍታል።")
-        self.btn_add.Bind(wx.EVT_BUTTON, self.add_event)
-        btn_row.Add(self.btn_add, 0, wx.ALL, 4)
-
-        self.btn_clear = wx.Button(self, label="&ሁሉንም ክንውኖች አጥፋ")
-        self.btn_clear.SetName("ሁሉንም ክንውኖች አጥፋ")
-        self.btn_clear.SetHelpText("ሁሉንም የግል ክንውኖች ያጠፋል።")
-        self.btn_clear.Bind(wx.EVT_BUTTON, self.clear_events)
-        btn_row.Add(self.btn_clear, 0, wx.ALL, 4)
-
-        h.addItem(btn_row)
-
-        exp_row = wx.BoxSizer(wx.HORIZONTAL)
-        for label, fmt in [("CSV", "csv"), ("TSV", "tsv"), ("JSON", "json"),
-                           ("Markdown", "md"), ("HTML", "html")]:
-            b = wx.Button(self, label=label)
-            b.Bind(wx.EVT_BUTTON, lambda e, f=fmt: self.export(f))
-            exp_row.Add(b, 0, wx.ALL, 2)
-        b = wx.Button(self, label="iCal")
-        b.Bind(wx.EVT_BUTTON, self.export_ical)
-        exp_row.Add(b, 0, wx.ALL, 2)
-        h.addItem(exp_row)
-
-        close = wx.Button(self, label="&ዝጋ")
-        close.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CANCEL))
-        h.addItem(close)
+        export_row = _button_row(self, [
+            ("ወደ CSV ላክ", lambda e: self.export('csv')),
+            ("ወደ TSV ላክ", lambda e: self.export('tsv')),
+            ("ወደ JSON ላክ", lambda e: self.export('json')),
+            ("ወደ Markdown ላክ", lambda e: self.export('md')),
+            ("ወደ HTML ላክ", lambda e: self.export('html')),
+            ("ወደ iCal ላክ", self.export_ical),
+        ])
+        close = wx.Button(self, wx.ID_CANCEL, label="&ዝጋ")
+        export_row.Add(close, 0, wx.ALL, 2)
+        h.addItem(export_row)
 
         self.SetSizerAndFit(h.sizer)
-        self.SetMinSize((560, 260))
         self.CentreOnScreen()
 
     def show_agenda_page(self, event=None):
-        items = self.plugin._agenda_items(self.showdone.GetValue())
-        if not items:
-            ui.message("ምንም የአጀንዳ ውሂብ የለም።")
+        if not self.plugin._agenda_items(self.showdone.GetValue()):
+            ui.message("ምንም የአጀንዳ ውሂብ የለም። የግል ክንውን ይጨምሩ ወይም ዕቅድ ያስቀምጡ።")
             return
-        html = render_agenda_html(self.plugin, items)
-        self.plugin.show_html("አጀንዳ", html)
-        ui.message(f"አጀንዳው {len(items)} ውሂብ ይዟል። በርዕስ ለመዘዋወር H ይጠቀሙ።")
+        self.show_done = self.showdone.GetValue()
+        self.action = 'page'
+        self.EndModal(wx.ID_OK)
+
+    def show_day_agenda(self, event=None):
+        ey, em, ed = self.plugin.get_ethiopian_date()
+        dlg = DateChoiceDialog(self, self.plugin, "የቀን አጀንዳ", ey, em, ed)
+        if dlg.ShowModal() == wx.ID_OK:
+            self.day_date = dlg.date()
+            dlg.Destroy()
+            self.action = 'day'
+            self.EndModal(wx.ID_OK)
+            return
+        dlg.Destroy()
 
     def add_event(self, event):
         ey, em, ed = self.plugin.get_ethiopian_date()
         dlg = AddAgendaEventDialog(self, self.plugin, ey, em, ed)
         if dlg.ShowModal() == wx.ID_OK:
             title = dlg.title.GetValue().strip()
-            if title:
-                ev = self.plugin._load_events()
-                ev.append({
-                    'id': datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'),
-                    'date': {'ey': dlg.y.GetValue(), 'em': dlg.m.GetValue(), 'ed': dlg.d.GetValue()},
-                    'title': title,
-                    'details': dlg.details.GetValue().strip(),
-                })
-                self.plugin._save_events(ev)
-                ui.message("የግል ክንውን ተመዝግቧል።")
+            self.plugin.add_agenda_event(dlg.date(), title, dlg.details.GetValue().strip())
+            ui.message(f"የግል ክንውን ተመዝግቧል፦ {title}")
         dlg.Destroy()
 
+    def change_status(self, event=None):
+        tasks = [i for i in self.plugin._agenda_items(True) if i['type'] == 'task']
+        if not tasks:
+            ui.message("ምንም የዕቅድ ተግባር የለም።")
+            return
+        choices = [f"{n}. {eth_date_label(self.plugin, t['date'])} — {t['title'] or 'ያለ ስም'} "
+                   f"({t['planName']}) — {plan_status_label(t['status'])}"
+                   for n, t in enumerate(tasks, 1)]
+        today = self.plugin.ethiopian_to_jdn(*self.plugin.get_ethiopian_date())
+        start = next((n for n, t in enumerate(tasks)
+                      if t['jdn'] >= today and t['status'] not in ('done', 'skipped')), 0)
+        pick = wx.SingleChoiceDialog(self, 'ሁኔታውን የሚቀይሩት ተግባር ይምረጡ፣', 'የተግባር ሁኔታ ቀይር', choices)
+        pick.SetSelection(start)
+        if pick.ShowModal() != wx.ID_OK:
+            pick.Destroy()
+            return
+        task = tasks[pick.GetSelection()]
+        pick.Destroy()
+        status = wx.SingleChoiceDialog(self, 'አዲሱን ሁኔታ ይምረጡ፣', 'ሁኔታ',
+                                        [PLAN_STATUS_LABELS[k] for k in PLAN_STATUS_KEYS])
+        current = task['status'] if task['status'] in PLAN_STATUS_KEYS else 'planned'
+        status.SetSelection(PLAN_STATUS_KEYS.index(current))
+        if status.ShowModal() == wx.ID_OK:
+            key = PLAN_STATUS_KEYS[status.GetSelection()]
+            if self.plugin._set_task_status(task['planId'], task['rowId'], key):
+                ui.message(f"ሁኔታው ተቀይሯል፦ {plan_status_label(key)}")
+            else:
+                ui.message("ተግባሩ አልተገኘም።")
+        status.Destroy()
+
+    def delete_event(self, event=None):
+        events = sorted(self.plugin._load_events(),
+                        key=lambda e: self.plugin.ethiopian_to_jdn(**e['date']))
+        if not events:
+            ui.message("ምንም የግል ክንውን አልተመዘገበም።")
+            return
+        choices = [f"{eth_date_label(self.plugin, e['date'])} — {e.get('title', '')}" for e in events]
+        pick = wx.SingleChoiceDialog(self, 'የሚያጠፉትን ክንውን ይምረጡ፣', 'አንድ ክንውን አጥፋ', choices)
+        if pick.ShowModal() != wx.ID_OK:
+            pick.Destroy()
+            return
+        chosen = events[pick.GetSelection()]
+        pick.Destroy()
+        confirm = wx.MessageDialog(self, f"«{chosen.get('title', '')}» ማጥፋት ይፈልጋሉ?", "አረጋግጥ",
+                                    wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION)
+        if confirm.ShowModal() == wx.ID_YES:
+            self.plugin._delete_event(chosen.get('id'))
+            ui.message("ክንውኑ ጠፍቷል።")
+        confirm.Destroy()
+
     def clear_events(self, event):
+        if not self.plugin._load_events():
+            ui.message("ምንም የግል ክንውን አልተመዘገበም።")
+            return
         dlg = wx.MessageDialog(
             self, "ሁሉንም የግል ክንውኖች ማጥፋት ይፈልጋሉ?", "አረጋግጥ",
             wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
@@ -1413,16 +1657,23 @@ class AgendaDialog(wx.Dialog):
         dlg.Destroy()
 
     def export(self, fmt):
-        items = self.plugin._agenda_items(self.showdone.GetValue())
+        items = self.plugin._agenda_items(True)
+        if not items:
+            ui.message("ምንም የአጀንዳ ውሂብ የለም።")
+            return
         self.plugin._export_file(
             self.plugin._agenda_export_text(items, fmt),
-            f'agenda.{fmt}', 'text/plain'
+            f'agenda.{fmt}', self.plugin._mime(fmt), self
         )
 
     def export_ical(self, event=None):
+        items = self.plugin._agenda_items(self.showdone.GetValue())
+        if not items:
+            ui.message("ምንም የአጀንዳ ውሂብ የለም።")
+            return
         self.plugin._export_file(
-            self.plugin._build_ical(self.plugin._agenda_items(True), 'Agenda', 'agenda'),
-            'agenda.ics', 'text/calendar'
+            self.plugin._build_agenda_ical(items),
+            'agenda.ics', 'text/calendar', self
         )
 
 
@@ -1553,23 +1804,23 @@ class GitsaweMixin:
                             continue
                         msb = srv.get("ምስባክ")
                         if msb:
-                            book_ch = f"{msb.get('book','')} {msb.get('chapter_verse','')}".lower()
+                            book_ch = f"{msb.get('book') or ''} {msb.get('chapter_verse') or ''}".lower()
                             verses_text = " ".join(msb.get("verses") or []).lower()
                             if q in book_ch or q in verses_text:
                                 matched = True
-                                match_text.append(f"{srv_key} ምስባክ: {msb.get('book','')} {msb.get('chapter_verse','')}")
+                                match_text.append(f"{srv_key} ምስባክ: {msb.get('book') or ''} {msb.get('chapter_verse') or ''}")
                         wng = srv.get("ወንጌል")
                         if wng:
-                            book_ch = f"{wng.get('book','')} {wng.get('chapter_verse','')}".lower()
+                            book_ch = f"{wng.get('book') or ''} {wng.get('chapter_verse') or ''}".lower()
                             incipit = (wng.get("incipit") or "").lower()
                             if q in book_ch or q in incipit:
                                 matched = True
-                                match_text.append(f"{srv_key} ወንጌል: {wng.get('book','')} {wng.get('chapter_verse','')} ({wng.get('incipit','')})")
+                                match_text.append(f"{srv_key} ወንጌል: {wng.get('book') or ''} {wng.get('chapter_verse') or ''} ({wng.get('incipit') or ''})")
                         for ep in (srv.get("epistles_and_acts") or []):
-                            ep_text = f"{ep.get('reading_type','')} {ep.get('chapter_verse','')} {ep.get('incipit','')}".lower()
+                            ep_text = f"{ep.get('reading_type') or ''} {ep.get('chapter_verse') or ''} {ep.get('incipit') or ''}".lower()
                             if q in ep_text:
                                 matched = True
-                                match_text.append(f"{srv_key} ንባብ: {ep.get('reading_type','')} {ep.get('chapter_verse','')}")
+                                match_text.append(f"{srv_key} ንባብ: {ep.get('reading_type') or ''} {ep.get('chapter_verse') or ''}")
 
                     if matched:
                         results.append({
@@ -1582,6 +1833,10 @@ class GitsaweMixin:
                             "reading": d,
                         })
         return results
+
+    @staticmethod
+    def _present(value):
+        return value is not None and value is not False and value != 0 and value != ""
 
     def format_reading_sections(self, day_reading, options=None):
         options = options or {}
@@ -1600,24 +1855,24 @@ class GitsaweMixin:
 
         def render_service(title, slot_key, service_data):
             nonlocal ref_counter
-            if not service_data:
+            if not self._present(service_data):
                 return
             blocks.append({"kind": "service_header", "text": title})
 
             msb = service_data.get("ምስባክ")
-            if msb:
+            if self._present(msb):
                 ref_id = f"gitsawe-ref-{ref_counter}"
                 ref_counter += 1
                 blocks.append({
                     "kind": "mesbak_header",
                     "badge": "ምስባክ",
-                    "book": msb.get("book", "መዝሙር"),
-                    "cv": msb.get("chapter_verse", ""),
+                    "book": msb.get("book") or "መዝሙር",
+                    "cv": msb.get("chapter_verse") or "",
                     "psalm_masoretic": msb.get("psalm_masoretic"),
                     "verses": msb.get("verses") or [],
                     "ref_id": ref_id,
-                    "book_raw": msb.get("book", ""),
-                    "cv_raw": msb.get("chapter_verse", ""),
+                    "book_raw": msb.get("book") or "",
+                    "cv_raw": msb.get("chapter_verse") or "",
                     "context": "psalm",
                     "month": em, "day": ed, "slot": slot_key, "role": "mesbak",
                 })
@@ -1630,29 +1885,29 @@ class GitsaweMixin:
                     ref_counter += 1
                     blocks.append({
                         "kind": "epistle",
-                        "reading_type": ep.get("reading_type", ""),
-                        "cv": ep.get("chapter_verse", ""),
+                        "reading_type": ep.get("reading_type") or "",
+                        "cv": ep.get("chapter_verse") or "",
                         "incipit": ep.get("incipit"),
                         "ref_id": ref_id,
-                        "book_raw": ep.get("reading_type", ""),
-                        "cv_raw": ep.get("chapter_verse", ""),
+                        "book_raw": ep.get("reading_type") or "",
+                        "cv_raw": ep.get("chapter_verse") or "",
                         "context": "epistle",
                         "month": em, "day": ed, "slot": slot_key, "role": f"ep{ep_idx}",
                     })
 
             wng = service_data.get("ወንጌል")
-            if wng:
+            if self._present(wng):
                 ref_id = f"gitsawe-ref-{ref_counter}"
                 ref_counter += 1
                 blocks.append({
                     "kind": "gospel",
                     "badge": "ወንጌል",
-                    "book": wng.get("book", ""),
-                    "cv": wng.get("chapter_verse", ""),
+                    "book": wng.get("book") or "",
+                    "cv": wng.get("chapter_verse") or "",
                     "incipit": wng.get("incipit"),
                     "ref_id": ref_id,
-                    "book_raw": wng.get("book", ""),
-                    "cv_raw": wng.get("chapter_verse", ""),
+                    "book_raw": wng.get("book") or "",
+                    "cv_raw": wng.get("chapter_verse") or "",
                     "context": "gospel",
                     "month": em, "day": ed, "slot": slot_key, "role": "gospel",
                 })
@@ -1661,11 +1916,11 @@ class GitsaweMixin:
             if kidassie:
                 blocks.append({"kind": "anaphora", "badge": "ቅዳሴ", "text": kidassie})
 
-        if srv.get("ዘነግህ"):
+        if self._present(srv.get("ዘነግህ")):
             render_service("ዘነግህ (Morning Reading)", "ዘነግህ", srv["ዘነግህ"])
-        if srv.get("ዘቅዳሴ"):
+        if self._present(srv.get("ዘቅዳሴ")):
             render_service("ዘቅዳሴ (Eucharistic Liturgy Readings)", "ዘቅዳሴ", srv["ዘቅዳሴ"])
-        if srv.get("ዘሠርክ"):
+        if self._present(srv.get("ዘሠርክ")):
             render_service("ዘሠርክ (Evening Reading)", "ዘሠርክ", srv["ዘሠርክ"])
 
         return blocks
@@ -1902,7 +2157,7 @@ class GitsaweMixin:
             key = f"{ref.get('month')}-{ref.get('day')}-{ref.get('slot')}-{ref.get('role')}"
             c = (self._gitsawe_corrections or {}).get(key)
             if c and (not master_ok or (master_bn == c.get("bn") and cv.get("chapter") == c.get("sc"))):
-                vend = "END" if c.get("sc") == c.get("ec") and c.get("ev") == "END" else c.get("ev")
+                vend = c.get("ev") if c.get("sc") == c.get("ec") else "END"
                 result = self.get_verses(c["bn"], c["sc"], c["sv"], vend)
                 if result:
                     result["corrected"] = True
@@ -1924,21 +2179,25 @@ class PlanningAgendaMixin:
     def _load_plans(self):
         try:
             p, _ = self._planning_paths()
-            return json.load(open(p, 'r', encoding='utf-8'))
+            with open(p, 'r', encoding='utf-8') as f:
+                v = json.load(f)
+            return v if isinstance(v, list) else []
         except Exception:
             return []
 
     def _save_plans(self, plans):
         try:
             p, _ = self._planning_paths()
-            json.dump(plans, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(plans, f, ensure_ascii=False, indent=2)
         except Exception:
             logHandler.log.error('Planning save failed', exc_info=True)
 
     def _load_events(self):
         try:
             _, p = self._planning_paths()
-            v = json.load(open(p, 'r', encoding='utf-8'))
+            with open(p, 'r', encoding='utf-8') as f:
+                v = json.load(f)
             return v if isinstance(v, list) else []
         except Exception:
             return []
@@ -1946,9 +2205,33 @@ class PlanningAgendaMixin:
     def _save_events(self, events):
         try:
             _, p = self._planning_paths()
-            json.dump(events, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(events, f, ensure_ascii=False, indent=2)
         except Exception:
             logHandler.log.error('Agenda save failed', exc_info=True)
+
+    def _delete_event(self, event_id):
+        self._save_events([e for e in self._load_events() if str(e.get('id')) != str(event_id)])
+
+    def _set_task_status(self, plan_id, row_id, status):
+        plans = self._load_plans()
+        found = False
+        for p in plans:
+            if str(p.get('id')) != str(plan_id):
+                continue
+            for r in p.get('rows', []):
+                if str(r.get('id')) == str(row_id):
+                    r['status'] = status
+                    found = True
+        if not found:
+            return False
+        self._save_plans(plans)
+        draft = getattr(self, 'planning_draft', None)
+        if draft and str(draft.get('id')) == str(plan_id):
+            for r in draft.get('rows', []):
+                if str(r.get('id')) == str(row_id):
+                    r['status'] = status
+        return True
 
     def _planning_add_months(self, d, n):
         total = d['ey'] * 13 + (d['em'] - 1) + n
@@ -1959,6 +2242,84 @@ class PlanningAgendaMixin:
     def _planning_add_years(self, d, n):
         ey = d['ey'] + n
         return {'ey': ey, 'em': d['em'], 'ed': min(d['ed'], self.get_month_length(ey, d['em']))}
+
+    def _planning_add_unit(self, d, n, u):
+        if u in ('day', 'week'):
+            days = n if u == 'day' else n * 7
+            y, m, day = self.jdn_to_ethiopian(self.ethiopian_to_jdn(**d) + days)
+            return {'ey': y, 'em': m, 'ed': day}
+        if u == 'month':
+            return self._planning_add_months(d, n)
+        if u == 'year':
+            return self._planning_add_years(d, n)
+        raise ValueError('Unsupported interval unit.')
+
+    def _season_matches(self, info, family, season_id):
+        if family in (None, '', 'all', 'none') or season_id in (None, '', 'all'):
+            return True
+        label = dict(PLAN_SEASON_CATALOGS.get(family, [])).get(season_id)
+        if label is None:
+            return False
+        if family == 'climatic':
+            return info['climatic'] == label
+        if family == 'fasting':
+            return info['fasting'] == label if season_id == 'none' else label in info['fasting']
+        if family == 'liturgical':
+            return info['liturgical'] == label
+        if family == 'lent-week':
+            return info['greatLentWeek'] == label
+        return False
+
+    def generate_plan(self, name, start, period_value, period_unit, interval_value, interval_unit,
+                      family='all', season_id='all', end=None):
+        if start['ed'] > self.get_month_length(start['ey'], start['em']):
+            raise ValueError('የመጀመሪያ ቀን ልክ አይደለም።')
+        if period_unit == 'custom':
+            if not end or end['ed'] > self.get_month_length(end['ey'], end['em']):
+                raise ValueError('የመጨረሻ ቀን ልክ አይደለም።')
+            end_j = self.ethiopian_to_jdn(**end) + 1
+            if end_j <= self.ethiopian_to_jdn(**start):
+                raise ValueError('የመጨረሻ ቀን ከመጀመሪያ ቀን በፊት ነው።')
+        else:
+            end_j = self.ethiopian_to_jdn(**self._planning_add_unit(start, period_value, period_unit))
+        rows = []
+        cur = dict(start)
+        guard = 0
+        while self.ethiopian_to_jdn(**cur) < end_j and guard < 5000:
+            info = self._season_info(cur)
+            if self._season_matches(info, family, season_id):
+                rows.append({'id': f"{cur['ey']}-{cur['em']}-{cur['ed']}", 'date': dict(cur),
+                             'season': info, 'title': '', 'details': '', 'status': 'planned'})
+            nxt = self._planning_add_unit(cur, interval_value, interval_unit)
+            if self.ethiopian_to_jdn(**nxt) <= self.ethiopian_to_jdn(**cur):
+                raise ValueError('የክፍሉ ጊዜ ዕቅዱን አያራምድም።')
+            cur = nxt
+            guard += 1
+        if guard >= 5000:
+            raise ValueError('ዕቅዱ በጣም ትልቅ ነው።')
+        plan = {'id': datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'),
+                'name': (name or '').strip() or 'Ethiopian Plan', 'start': dict(start),
+                'periodMode': 'date-range' if period_unit == 'custom' else 'duration',
+                'periodValue': period_value, 'periodUnit': period_unit,
+                'intervalValue': interval_value, 'intervalUnit': interval_unit,
+                'seasonCategory': 'all' if family == 'none' else family,
+                'seasonId': 'all' if family == 'none' else season_id, 'rows': rows}
+        if period_unit == 'custom':
+            plan['endDate'] = dict(end)
+        return plan
+
+    def add_agenda_event(self, date, title, details=''):
+        title = (title or '').strip()
+        if not title:
+            raise ValueError('ስም ማስገባት ያስፈልጋል።')
+        if not (1 <= date['em'] <= 13) or not (1 <= date['ed'] <= self.get_month_length(date['ey'], date['em'])):
+            raise ValueError('የተሳሳተ ቀን።')
+        events = self._load_events()
+        event = {'id': datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'), 'date': dict(date),
+                 'title': title, 'details': (details or '').strip()}
+        events.append(event)
+        self._save_events(events)
+        return event
 
     def _season_info(self, d):
         meta = self.calculate_bahre_hasab(d['ey'])
@@ -1971,89 +2332,196 @@ class PlanningAgendaMixin:
             'greatLentWeek': self.get_great_lent_week_name(wk) if wk else ''
         }
 
+    @staticmethod
+    def _date_label(d):
+        return f"{d['ey']}-{d['em']:02d}-{d['ed']:02d}"
+
+    @staticmethod
+    def _csv_field(value, specials):
+        s = '' if value is None else str(value)
+        if any(c in s for c in specials):
+            return '"' + s.replace('"', '""') + '"'
+        return s
+
+    @staticmethod
+    def _tsv_field(value):
+        s = '' if value is None else str(value)
+        return s.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+    @staticmethod
+    def _md_field(value):
+        return ('' if value is None else str(value)).replace('|', '\\|')
+
+    @staticmethod
+    def _html_field(value):
+        s = '' if value is None else str(value)
+        return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                .replace('"', '&quot;').replace("'", '&#39;'))
+
     def _planning_export_text(self, p, fmt):
         rows = p.get('rows', [])
-        date = lambda d: f"{d['ey']}-{d['em']:02d}-{d['ed']:02d}"
+        label = self._date_label
+        season = lambda r, k: (r.get('season') or {}).get(k, '')
         head = ['Ethiopian Date', 'Climatic Season', 'Fasting Season', 'Liturgical Season',
                 'Great Lent Week', 'Title', 'Details', 'Status']
-        vals = [[date(r['date']), r.get('season', {}).get('climatic', ''),
-                 r.get('season', {}).get('fasting', ''), r.get('season', {}).get('liturgical', ''),
-                 r.get('season', {}).get('greatLentWeek', ''), r.get('title', ''),
-                 r.get('details', ''), r.get('status', '')] for r in rows]
+        cells = [[label(r['date']), season(r, 'climatic'), season(r, 'fasting'), season(r, 'liturgical'),
+                  season(r, 'greatLentWeek'), r.get('title'), r.get('details'), r.get('status')] for r in rows]
+        meta_head = ['Planning Mode', 'Planning Start', 'Planning End', 'Planning Period',
+                     'Planning Interval', 'Season Filter']
+        meta = [p.get('periodMode') or 'duration', label(p['start']),
+                label(p['endDate']) if p.get('endDate') else '',
+                f"{p.get('periodValue')} {p.get('periodUnit')}",
+                f"{p.get('intervalValue')} {p.get('intervalUnit')}", p.get('seasonId') or 'all']
+        name = p.get('name') or 'Ethiopian Plan'
+        season_header = (f"Season Filter: {p.get('seasonId')}"
+                         if p.get('seasonCategory') and p.get('seasonCategory') != 'all' else 'Season Filter: All')
+        if p.get('periodMode') == 'date-range':
+            period_header = f"Planning Range: {label(p['start'])} through {label(p['endDate'])}"
+        else:
+            period_header = f"Planning Period: {p.get('periodValue')} {p.get('periodUnit')}(s)"
+
         if fmt == 'json':
             return json.dumps(p, ensure_ascii=False, indent=2)
-        if fmt in ('csv', 'tsv'):
-            import csv, io
-            out = io.StringIO()
-            w = csv.writer(out, delimiter='\t' if fmt == 'tsv' else ',', lineterminator='\n')
-            w.writerow(['Planning Mode', 'Planning Start', 'Planning End', 'Planning Period',
-                        'Planning Interval', 'Season Filter'])
-            w.writerow([p.get('periodMode', 'duration'), date(p['start']),
-                        date(p.get('endDate', {})) if p.get('endDate') else '',
-                        f"{p.get('periodValue', 1)} {p.get('periodUnit', 'day')}",
-                        f"{p.get('intervalValue', 1)} {p.get('intervalUnit', 'day')}",
-                        p.get('seasonId', 'all')])
-            w.writerow([])
-            w.writerow(head)
-            w.writerows(vals)
-            return out.getvalue()
+        if fmt == 'csv':
+            esc = lambda v: self._csv_field(v, ',"\n\r')
+            return '\n'.join([','.join(meta_head), ','.join(esc(v) for v in meta), '', ','.join(head)]
+                             + [','.join(esc(v) for v in row) for row in cells])
+        if fmt == 'tsv':
+            return '\n'.join(['\t'.join(meta_head), '\t'.join(self._tsv_field(v) for v in meta), '',
+                              '\t'.join(head)]
+                             + ['\t'.join(self._tsv_field(v) for v in row) for row in cells])
         if fmt == 'md':
-            return '\n'.join([f"# {p.get('name', 'Ethiopian Plan')}",
-                              f"Planning Period: {p.get('periodValue', 1)} {p.get('periodUnit', 'day')}",
-                              f"Season Filter: {p.get('seasonId', 'all')}", '',
-                              '| ' + ' | '.join(head) + ' |',
-                              '|' + '|'.join(['---'] * len(head)) + '|']
-                             + ['| ' + ' | '.join(str(x).replace('|', '\\|').replace('\n', '<br>') for x in row) + ' |'
-                                for row in vals])
+            return '\n'.join([f"# {name}", period_header, season_header, '',
+                              '| ' + ' | '.join(head) + ' |', '|' + '|'.join(['---'] * len(head)) + '|']
+                             + ['| ' + ' | '.join(self._md_field(v) for v in row) + ' |' for row in cells])
         if fmt == 'html':
-            esc = lambda x: str(x or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
-            return ('<!doctype html><html><meta charset="utf-8"><title>'
-                    + esc(p.get('name', 'Ethiopian Plan'))
-                    + '</title><table><thead><tr>'
-                    + ''.join('<th>' + esc(x) + '</th>' for x in head)
+            esc = self._html_field
+            return ('<!doctype html><html lang="am"><head><meta charset="utf-8"><title>' + esc(name) + '</title>'
+                    '<style>body{font-family:system-ui,sans-serif}table{border-collapse:collapse;width:100%}'
+                    'th,td{border:1px solid #999;padding:.5rem;text-align:left;vertical-align:top}</style></head>'
+                    '<body><main><h1>' + esc(name) + '</h1><p>' + esc(period_header) + '</p><p>'
+                    + esc(season_header) + '</p><table><caption>' + esc(name) + '</caption><thead><tr>'
+                    + ''.join('<th scope="col" lang="en">' + esc(x) + '</th>' for x in head)
                     + '</tr></thead><tbody>'
-                    + ''.join('<tr>' + ''.join('<td>' + esc(x) + '</td>' for x in row) + '</tr>' for row in vals)
-                    + '</tbody></table></html>')
-        raise ValueError('Unsupported export format')
+                    + ''.join('<tr>' + ''.join(('<th scope="row">' if i == 0 else '<td>') + esc(x)
+                                               + ('</th>' if i == 0 else '</td>') for i, x in enumerate(row)) + '</tr>'
+                              for row in cells)
+                    + '</tbody></table></main></body></html>')
+        raise ValueError(f'Unsupported export format: {fmt}')
+
+    @staticmethod
+    def _parse_delimited(text, delimiter):
+        rows, row, field, quoted = [], [], '', False
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            nxt = text[i + 1] if i + 1 < n else None
+            if quoted:
+                if c == '"' and nxt == '"':
+                    field += '"'
+                    i += 1
+                elif c == '"':
+                    quoted = False
+                else:
+                    field += c
+            elif c == '"':
+                quoted = True
+            elif c == delimiter:
+                row.append(field)
+                field = ''
+            elif c == '\n':
+                row.append(field)
+                rows.append(row)
+                row, field = [], ''
+            elif c != '\r':
+                field += c
+            i += 1
+        if field != '' or row:
+            row.append(field)
+            rows.append(row)
+        return rows
 
     def _planning_import_text(self, text, fmt):
+        stamp = 'imported-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
         if fmt == 'json':
             p = json.loads(text)
-            p['id'] = 'imported-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
+            if not isinstance(p, dict) or not p.get('start') or not isinstance(p.get('rows'), list):
+                raise ValueError('Invalid planning JSON.')
+            p['start'] = self._parse_planning_date(self._date_label(p['start']))
+            if p.get('endDate'):
+                p['endDate'] = self._parse_planning_date(self._date_label(p['endDate']))
+            rows = []
+            for r in p['rows']:
+                row = dict(r)
+                row['date'] = self._parse_planning_date(self._date_label(r['date']))
+                row['title'] = str(r.get('title') or '')
+                row['details'] = str(r.get('details') or '')
+                row['status'] = r.get('status') or 'planned'
+                rows.append(row)
+            p['rows'] = rows
+            p['id'] = stamp
             return p
-        import csv, io
-        rows = list(csv.reader(io.StringIO(text), delimiter='\t' if fmt == 'tsv' else ','))
-        hdr = next((i for i, r in enumerate(rows) if 'Ethiopian Date' in r), -1)
-        if hdr < 0:
+        rows = self._parse_delimited(text, '\t' if fmt == 'tsv' else ',')
+        header = next((i for i, r in enumerate(rows) if any(str(x).strip() == 'Ethiopian Date' for x in r)), -1)
+        if header < 0 or len(rows) < header + 2:
+            raise ValueError('Missing planning table.')
+        h = [str(x).strip() for x in rows[header]]
+        idx = lambda name: h.index(name) if name in h else -1
+        di = idx('Ethiopian Date')
+        if di < 0:
             raise ValueError('Missing Ethiopian Date column.')
-        meta = rows[1]
-        h = rows[hdr]
-        idx = {v: i for i, v in enumerate(h)}
-        p = {'id': 'imported-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'),
-             'name': 'Imported Ethiopian Plan',
-             'periodMode': meta[0] if meta else 'duration',
-             'start': self._parse_planning_date(meta[1]),
-             'periodValue': 1, 'periodUnit': 'day',
-             'intervalValue': 1, 'intervalUnit': 'day',
-             'seasonCategory': 'all', 'seasonId': 'all', 'rows': []}
-        for r in rows[hdr + 1:]:
-            if not r or not r[idx.get('Ethiopian Date', 0)]:
+        meta = rows[1] if len(rows) > 1 else []
+        get = lambda i: meta[i] if 0 <= i < len(meta) else ''
+        start = self._parse_planning_date(get(1))
+        end = self._parse_planning_date(get(2)) if get(2) else None
+
+        def pair(value):
+            parts = str(value or '1 day').split()
+            try:
+                num = float(parts[0]) if parts else 0
+            except ValueError:
+                num = 0
+            return (int(num) if num == int(num) and num else 1), (parts[1] if len(parts) > 1 else 'day')
+
+        pv, pu = pair(get(3))
+        iv, iu = pair(get(4))
+        p = {'id': stamp, 'name': 'Imported Ethiopian Plan', 'periodMode': get(0) or 'duration',
+             'start': start, 'periodValue': pv, 'periodUnit': pu, 'intervalValue': iv, 'intervalUnit': iu,
+             'seasonCategory': 'all', 'seasonId': get(5) or 'all', 'rows': []}
+        if end:
+            p['endDate'] = end
+            p['periodUnit'] = 'custom'
+            p['endExclusive'] = self._planning_end_exclusive(end)
+
+        def cell(r, name):
+            i = idx(name)
+            return (r[i] if 0 <= i < len(r) else '') or ''
+
+        for r in rows[header + 1:]:
+            if di >= len(r) or not r[di]:
                 continue
-            d = self._parse_planning_date(r[idx['Ethiopian Date']])
+            d = self._parse_planning_date(r[di])
             p['rows'].append({
                 'id': f"{d['ey']}-{d['em']}-{d['ed']}", 'date': d,
-                'season': {'climatic': r[idx['Climatic Season']] if 'Climatic Season' in idx else '',
-                           'fasting': r[idx['Fasting Season']] if 'Fasting Season' in idx else '',
-                           'liturgical': r[idx['Liturgical Season']] if 'Liturgical Season' in idx else '',
-                           'greatLentWeek': r[idx['Great Lent Week']] if 'Great Lent Week' in idx else ''},
-                'title': r[idx['Title']] if 'Title' in idx else '',
-                'details': r[idx['Details']] if 'Details' in idx else '',
-                'status': r[idx['Status']] if 'Status' in idx else 'planned'})
+                'season': {'climatic': cell(r, 'Climatic Season'), 'fasting': cell(r, 'Fasting Season'),
+                           'liturgical': cell(r, 'Liturgical Season'),
+                           'greatLentWeek': cell(r, 'Great Lent Week')},
+                'title': cell(r, 'Title'), 'details': cell(r, 'Details'),
+                'status': cell(r, 'Status') or 'planned'})
+        if not p['rows']:
+            raise ValueError('No planning rows found.')
         return p
 
+    def _planning_end_exclusive(self, end):
+        y, m, d = self.jdn_to_ethiopian(self.ethiopian_to_jdn(end['ey'], end['em'], end['ed']) + 1)
+        return {'ey': y, 'em': m, 'ed': d}
+
     def _parse_planning_date(self, s):
-        a = [int(x) for x in str(s).strip().split('-')]
-        d = {'ey': a[0], 'em': a[1], 'ed': a[2]}
+        import re as _re
+        m = _re.match(r'^(\d+)-(\d{1,2})-(\d{1,2})$', str(s or '').strip())
+        if not m:
+            raise ValueError('Invalid Ethiopian date.')
+        d = {'ey': int(m.group(1)), 'em': int(m.group(2)), 'ed': int(m.group(3))}
         if d['em'] < 1 or d['em'] > 13 or d['ed'] < 1 or d['ed'] > self.get_month_length(d['ey'], d['em']):
             raise ValueError('Invalid Ethiopian date.')
         return d
@@ -2065,8 +2533,8 @@ class PlanningAgendaMixin:
         return {'json': 'application/json', 'csv': 'text/csv', 'tsv': 'text/tab-separated-values',
                 'md': 'text/markdown', 'html': 'text/html'}.get(fmt, 'text/plain')
 
-    def _export_file(self, text, default, mime):
-        dlg = wx.FileDialog(gui.mainFrame, 'ፋይል ያስቀምጡ', defaultFile=default,
+    def _export_file(self, text, default, mime, parent=None):
+        dlg = wx.FileDialog(parent or gui.mainFrame, 'ፋይል ያስቀምጡ', defaultFile=default,
                             wildcard='All files|*.*', style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
         if dlg.ShowModal() == wx.ID_OK:
             try:
@@ -2083,97 +2551,229 @@ class PlanningAgendaMixin:
     def _ics_date(self, g):
         return g.strftime('%Y%m%d')
 
-    def _build_ical(self, items, name, prefix):
-        now = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-        lines = ['BEGIN:VCALENDAR', 'VERSION:2.0',
-                 'PRODID:-//Ethiopian Calendar and Bahire Hasab//EN', 'CALSCALE:GREGORIAN',
-                 f"X-WR-CALNAME:{self._ics_escape(name)}"]
-        for i in items:
-            d = i.get('date', i)
-            g = self.eth_to_gregorian(d['ey'], d['em'], d['ed'])
-            end = g + datetime.timedelta(days=1)
-            desc = []
-            if i.get('details'):
-                desc.append(i['details'])
-            if i.get('planName'):
-                desc.append('ዕቅድ፦ ' + i['planName'])
-            if i.get('status'):
-                desc.append('ሁኔታ፦ ' + i['status'])
-            si = self._season_info(d)
-            desc += [f"የአየር ወቅት፦ {si['climatic']}", f"የጾም ወቅት፦ {si['fasting']}",
-                     f"የቤተክርስቲያን ዘመን፦ {si['liturgical']}"]
-            if si['greatLentWeek']:
-                desc.append('የዐቢይ ጾም ሳምንት፦ ' + si['greatLentWeek'])
-            summary = i.get('title') or ('ክንውን' if prefix == 'agenda' else name)
-            uid = f"{prefix}-{i.get('id') or d['ey']}-{d['em']}-{d['ed']}@ethio-calendar"
-            lines += ['BEGIN:VEVENT', f'UID:{uid}', f'DTSTAMP:{now}',
-                      f'DTSTART;VALUE=DATE:{self._ics_date(g)}',
-                      f'DTEND;VALUE=DATE:{self._ics_date(end)}',
-                      f'SUMMARY:{self._ics_escape(summary)}',
-                      f'DESCRIPTION:{self._ics_escape(chr(10).join(desc))}',
-                      'END:VEVENT']
-        lines.append('END:VCALENDAR')
-        return '\r\n'.join(lines)
+    def _ics_fold(self, line):
+        out, cur, size = [], '', 0
+        for ch in line:
+            n = len(ch.encode('utf-8'))
+            limit = 75 if not out else 74
+            if size + n > limit:
+                out.append(cur)
+                cur, size = ch, n
+            else:
+                cur += ch
+                size += n
+        out.append(cur)
+        return '\r\n '.join(out)
 
-    def _agenda_items(self, show_done=True):
+    def _vevent(self, uid, summary, start_g, end_g, description=''):
+        now = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        lines = ['BEGIN:VEVENT', f'UID:{uid}', f'DTSTAMP:{now}',
+                 f'DTSTART;VALUE=DATE:{self._ics_date(start_g)}',
+                 f'DTEND;VALUE=DATE:{self._ics_date(end_g)}',
+                 f'SUMMARY:{self._ics_escape(summary)}']
+        if description:
+            lines.append(f'DESCRIPTION:{self._ics_escape(description)}')
+        lines.append('END:VEVENT')
+        return lines
+
+    def _calendar(self, vevents, name):
+        lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Ethiopian Calendar and Bahire Hasab//EN',
+                 'CALSCALE:GREGORIAN', f'X-WR-CALNAME:{self._ics_escape(name)}']
+        for ev in vevents:
+            lines += ev
+        lines.append('END:VCALENDAR')
+        return '\r\n'.join(self._ics_fold(l) for l in lines) + '\r\n'
+
+    def _short_date_label(self, d):
+        try:
+            weekday = WEEKDAYS[self.eth_to_gregorian(d['ey'], d['em'], d['ed']).weekday()]
+            return f"{weekday}፣ {self.get_month_name(d['em'])} {d['ed']}"
+        except Exception:
+            return f"{self.get_month_name(d['em'])} {d['ed']}"
+
+    def _season_description(self, si):
+        parts = []
+        if si.get('climatic'):
+            parts.append(f"የአየር ወቅት፦ {si['climatic']}")
+        if si.get('fasting'):
+            parts.append(f"የጾም ወቅት፦ {si['fasting']}")
+        if si.get('liturgical'):
+            parts.append(f"የቤተክርስቲያን ዘመን፦ {si['liturgical']}")
+        if si.get('greatLentWeek'):
+            parts.append(f"የዐቢይ ጾም ሳምንት፦ {si['greatLentWeek']}")
+        return parts
+
+    def _build_plan_ical(self, plan):
+        vevents = []
+        for r in plan.get('rows', []):
+            d = r['date']
+            try:
+                g = self.eth_to_gregorian(d['ey'], d['em'], d['ed'])
+            except Exception:
+                continue
+            desc = []
+            if r.get('details'):
+                desc.append(r['details'])
+            desc += self._season_description(r.get('season') or self._season_info(d))
+            if r.get('status'):
+                desc.append('ሁኔታ፦ ' + plan_status_label(r['status']))
+            desc.append(self._short_date_label(d))
+            uid = f"plan-{plan.get('id') or 'p'}-{r.get('id') or self._date_label(d)}@ethio-calendar"
+            summary = r.get('title') or plan.get('name') or 'Planned Event'
+            vevents += [self._vevent(uid, summary, g, g + datetime.timedelta(days=1), '\n'.join(desc))]
+        return self._calendar(vevents, plan.get('name') or 'የዕቅድ ቀናት')
+
+    def _build_agenda_ical(self, items):
+        vevents = []
+        for it in items:
+            d = it['date']
+            try:
+                g = self.eth_to_gregorian(d['ey'], d['em'], d['ed'])
+            except Exception:
+                continue
+            is_event = it['type'] == 'event'
+            desc = []
+            if it.get('details'):
+                desc.append(it['details'])
+            if it.get('planName'):
+                desc.append('የተግባር ዝርዝር፦ ' + it['planName'])
+            if it.get('status'):
+                desc.append('ሁኔታ፦ ' + plan_status_label(it['status']))
+            desc += self._season_description(it)
+            desc.append(self._short_date_label(d))
+            uid = f"agenda-{'ev' if is_event else 'task'}-{it.get('eventId') or it.get('rowId') or it['jdn']}@ethio-calendar"
+            summary = it.get('title') or ('ክንውን' if is_event else 'የተግባር ዝርዝር')
+            vevents += [self._vevent(uid, summary, g, g + datetime.timedelta(days=1), '\n'.join(desc))]
+        return self._calendar(vevents, 'የተግባር ዝርዝር')
+
+    def _agenda_items(self, show_done=True, by_title=True):
         out = []
         for p in self._load_plans():
             for r in p.get('rows', []):
                 if not show_done and r.get('status') in ('done', 'skipped'):
                     continue
-                si = self._season_info(r['date'])
-                out.append({'id': r.get('id'), 'date': r['date'], 'type': 'task',
-                            'planName': p.get('name', ''), 'climatic': si['climatic'],
+                d = r['date']
+                si = self._season_info(d)
+                out.append({'id': r.get('id'), 'rowId': r.get('id'), 'planId': p.get('id'),
+                            'jdn': self.ethiopian_to_jdn(d['ey'], d['em'], d['ed']),
+                            'date': d, 'type': 'task',
+                            'planName': p.get('name') or 'Ethiopian Plan', 'climatic': si['climatic'],
                             'fasting': si['fasting'], 'liturgical': si['liturgical'],
                             'greatLentWeek': si['greatLentWeek'], 'title': r.get('title', ''),
                             'details': r.get('details', ''), 'status': r.get('status', 'planned')})
         for e in self._load_events():
-            d = e['date']
+            d = e.get('date')
+            if not d:
+                continue
             si = self._season_info(d)
-            out.append({'id': e.get('id'), 'date': d, 'type': 'event', 'planName': '',
+            out.append({'id': e.get('id'), 'eventId': e.get('id'),
+                        'jdn': self.ethiopian_to_jdn(d['ey'], d['em'], d['ed']),
+                        'date': d, 'type': 'event', 'planName': '',
                         'climatic': si['climatic'], 'fasting': si['fasting'],
                         'liturgical': si['liturgical'], 'greatLentWeek': si['greatLentWeek'],
                         'title': e.get('title', ''), 'details': e.get('details', ''), 'status': ''})
-        out.sort(key=lambda x: (self.ethiopian_to_jdn(**x['date']), x.get('planName', ''), x.get('title', '')))
+        out.sort(key=lambda x: (x['jdn'], (x.get('planName') or '').casefold(),
+                                (x.get('title') or '').casefold() if by_title else ''))
         return out
 
+    def _agenda_buckets(self, show_done=True):
+        items = self._agenda_items(show_done, by_title=False)
+        ey, em, ed = self.get_ethiopian_date()
+        today = self.ethiopian_to_jdn(ey, em, ed)
+        return {'overdue': [i for i in items if i['jdn'] < today],
+                'today': [i for i in items if i['jdn'] == today],
+                'upcoming': [i for i in items if i['jdn'] > today]}
+
+    def show_plan_page(self, plan, columns=None):
+        rows = plan.get('rows', [])
+        name = plan.get('name') or 'Ethiopian Plan'
+        self.show_html(f"{name} — {len(rows)} ቀናት", render_plan_html(self, plan, columns))
+        ui.message(f"ዕቅዱ ተከፍቷል። {len(rows)} ቀናት። በርዕስ ለመዘዋወር H፣ ለሠንጠረዥ T ይጠቀሙ።")
+
+    def show_agenda_page(self, show_done=True):
+        buckets = self._agenda_buckets(show_done)
+        total = sum(len(v) for v in buckets.values())
+        if not total:
+            ui.message("ምንም የአጀንዳ ውሂብ የለም። የግል ክንውን ይጨምሩ ወይም ዕቅድ ያስቀምጡ።")
+            return
+        self.show_html(f"አጀንዳ — {total}", render_agenda_html(self, buckets))
+        ui.message(f"አጀንዳው {total} ውሂብ ይዟል። በርዕስ ለመዘዋወር H፣ ለሠንጠረዥ T ይጠቀሙ።")
+
+    def _day_agenda_data(self, ey, em, ed):
+        target = self.eth_to_gregorian(ey, em, ed)
+        holidays = []
+        table = self.get_fdre_holidays(ey)
+        for key, label in (("celebrated", "የተከበረ ብሔራዊ በዓል"), ("memorial", "የመታሰቢያ ቀን"),
+                           ("religious", "የሃይማኖት በዓል")):
+            for h in table[key]:
+                if h["gregorian"] == target:
+                    holidays.append(f"{h['name_am']} ({h['name_en']})፣ {label}")
+        annual, monthly = self.split_synax_entries(self.get_synaxarium_by_date(em, ed))
+        gitsawe = []
+        try:
+            self.load_gitsawe()
+            reading = self.get_day_reading(em, ed)
+        except Exception:
+            reading = None
+        if reading:
+            if reading.get("commemoration"):
+                gitsawe.append(f"የዕለቱ መታሰቢያ፦ {reading['commemoration']}")
+            morning = (reading.get("services") or {}).get("ዘነግህ") or {}
+            msb = morning.get("ምስባክ")
+            if msb:
+                gitsawe.append(f"ምስባክ፦ {(msb.get('book') or '')} {(msb.get('chapter_verse') or '')}".strip())
+            wng = morning.get("ወንጌል")
+            if wng:
+                gitsawe.append(f"ወንጌል፦ {(wng.get('book') or '')} {(wng.get('chapter_verse') or '')}".strip())
+        si = self._season_info({"ey": ey, "em": em, "ed": ed})
+        season = [("የአየር ወቅት", si["climatic"]), ("የጾም ወቅት", si["fasting"]),
+                  ("የቤተክርስቲያን ዘመን", si["liturgical"])]
+        if si["greatLentWeek"]:
+            season.append(("የዐቢይ ጾም ሳምንት", si["greatLentWeek"]))
+        events = [e for e in self._load_events()
+                  if (e.get("date") or {}) == {"ey": ey, "em": em, "ed": ed}]
+        return {"holidays": holidays, "synax_annual": annual, "synax_monthly": monthly,
+                "gitsawe": gitsawe, "season": season, "events": events}
+
+    def show_day_agenda_page(self, ey, em, ed):
+        html = render_day_agenda_html(self, ey, em, ed, self._day_agenda_data(ey, em, ed))
+        title = eth_date_label(self, {"ey": ey, "em": em, "ed": ed})
+        self.show_html(f"የቀን አጀንዳ — {title}", html)
+        ui.message(f"የቀን አጀንዳ፦ {title}። በርዕስ ለመዘዋወር H ይጠቀሙ።")
+
     def _agenda_export_text(self, items, fmt):
-        h = ['Date', 'Ethiopian Date', 'Type', 'Plan', 'Climatic Season', 'Fasting Season',
-             'Liturgical Season', 'Great Lent Week', 'Title', 'Details', 'Status']
-        rows = []
-        for x in items:
-            d = x['date']
-            rows.append([f"{d['ey']}-{d['em']:02d}-{d['ed']:02d}", f"{d['ey']}-{d['em']}-{d['ed']}",
-                         x['type'], x['planName'], x['climatic'], x['fasting'], x['liturgical'],
-                         x['greatLentWeek'], x['title'], x['details'], x['status']])
-        if fmt == 'json':
-            return json.dumps([{'date': r[0],
-                                'ethiopianDate': {'ey': items[i]['date']['ey'], 'em': items[i]['date']['em'],
-                                                  'ed': items[i]['date']['ed']},
-                                'type': r[2], 'plan': r[3],
-                                'season': {'climatic': r[4], 'fasting': r[5],
-                                           'liturgical': r[6], 'greatLentWeek': r[7]},
-                                'title': r[8], 'details': r[9], 'status': r[10]}
-                               for i, r in enumerate(rows)], ensure_ascii=False, indent=2)
+        head = ['Date', 'Ethiopian Date', 'Type', 'Plan', 'Climatic Season', 'Fasting Season',
+                'Liturgical Season', 'Great Lent Week', 'Title', 'Details', 'Status']
+        rows = [[self._date_label(x['date']), f"{x['date']['ey']}-{x['date']['em']}-{x['date']['ed']}",
+                 x['type'], x['planName'], x['climatic'], x['fasting'], x['liturgical'],
+                 x['greatLentWeek'], x['title'], x['details'], x['status']] for x in items]
         if fmt in ('csv', 'tsv'):
-            import csv, io
-            out = io.StringIO()
-            csv.writer(out, delimiter='\t' if fmt == 'tsv' else ',', lineterminator='\n').writerows([h] + rows)
-            return out.getvalue()
+            delimiter = '\t' if fmt == 'tsv' else ','
+            esc = lambda v: self._csv_field(v, '",\n\r\t')
+            return '\n'.join(delimiter.join(esc(v) for v in row) for row in [head] + rows)
+        if fmt == 'json':
+            return json.dumps([{'date': f"{x['date']['ey']}-{x['date']['em']}-{x['date']['ed']}",
+                                'ethiopianDate': {'ey': x['date']['ey'], 'em': x['date']['em'], 'ed': x['date']['ed']},
+                                'type': x['type'], 'plan': x['planName'],
+                                'season': {'climatic': x['climatic'], 'fasting': x['fasting'],
+                                           'liturgical': x['liturgical'], 'greatLentWeek': x['greatLentWeek']},
+                                'title': x['title'], 'details': x['details'], 'status': x['status']}
+                               for x in items], ensure_ascii=False, indent=2)
         if fmt == 'md':
-            return '\n'.join(['# Agenda', '',
-                              '| ' + ' | '.join(h) + ' |',
-                              '|' + '|'.join(['---'] * len(h)) + '|']
-                             + ['| ' + ' | '.join(str(v).replace('|', '\\|').replace('\n', '<br>') for v in r) + ' |'
-                                for r in rows])
+            esc = lambda v: ('' if v is None else str(v)).replace('|', '\\|').replace('\n', '<br>')
+            return ('# Agenda\n\n| ' + ' | '.join(head) + ' |\n|' + '|'.join(['---'] * len(head)) + '|\n'
+                    + '\n'.join('| ' + ' | '.join(esc(v) for v in row) + ' |' for row in rows))
         if fmt == 'html':
-            esc = lambda x: str(x or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
-            return ('<!doctype html><html><meta charset="utf-8"><title>Agenda</title><table><thead><tr>'
-                    + ''.join('<th>' + esc(x) + '</th>' for x in h)
+            esc = lambda v: ('' if v is None else str(v)).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+            return ('<!doctype html><html lang="am"><head><meta charset="utf-8"><title>Agenda</title></head>'
+                    '<body><main><h1>Agenda</h1><table><caption>Agenda</caption><thead><tr>'
+                    + ''.join('<th scope="col" lang="en">' + esc(h) + '</th>' for h in head)
                     + '</tr></thead><tbody>'
-                    + ''.join('<tr>' + ''.join('<td>' + esc(x) + '</td>' for x in r) + '</tr>' for r in rows)
-                    + '</tbody></table></html>')
-        raise ValueError('Unsupported agenda export format')
+                    + ''.join('<tr>' + ''.join(('<th scope="row">' if i == 0 else '<td>') + esc(v)
+                                               + ('</th>' if i == 0 else '</td>') for i, v in enumerate(row)) + '</tr>'
+                              for row in rows)
+                    + '</tbody></table></main></body></html>')
+        raise ValueError(f'Unsupported agenda export format: {fmt}')
 
 
 # ============================================================
@@ -2383,6 +2983,7 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         self._addMenuItem(ethMenu, "የዛሬ ሙሉ መረጃ (ባሕረ ሐሳብ)\tCtrl+Shift+E", self.script_fullInfo)
         self._addMenuItem(ethMenu, "የዛሬ ሙሉ መረጃ በመስኮት\tCtrl+Shift+F", self.script_fullDateHtml)
         self._addMenuItem(ethMenu, "ብሔራዊ በዓላት\tCtrl+Shift+A", self.script_fdreHolidays)
+        self._addMenuItem(ethMenu, "የዓመቱን በዓላት ወደ iCal ላክ\tCtrl+Alt+H", self.script_holidaysIcal)
         self._addMenuItem(ethMenu, "የኢትዮጵያ ሰዓት\tCtrl+Shift+T", self.script_ethiopianLocalTime)
         self._addMenuItem(ethMenu, "የኬክሮስ ሰዓት\tCtrl+Shift+Q", self.script_kekrosTime)
         self._addMenuItem(ethMenu, "ቀኑን ኮፒ አድርግ\tCtrl+Shift+C", self.script_copyDate)
@@ -2391,11 +2992,10 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         self._addMenuItem(ethMenu, "የዛሬ ዓመታዊ በዓላት\tCtrl+Shift+S", self.script_readSynaxarium)
         self._addMenuItem(ethMenu, "የዛሬ ወርኃዊ በዓላት\tCtrl+Shift+W", self.script_readMonthlyFeasts)
         self._addMenuItem(ethMenu, "በስንክሳር ውስጥ ፈልግ\tCtrl+Shift+K", self.script_searchSynaxarium)
-        self._addMenuItem(ethMenu, "የዛሬ ግጻዌ (የቤተክርስቲያን ንባቦች)\tCtrl+Shift+R", self.script_gitsaweReadings)
-        self._addMenuItem(ethMenu, "በግጻዌ ውስጥ ፈልግ\tCtrl+Alt+R", self.script_gitsaweSearch)
         self._addMenuItem(ethMenu, "ዕቅድ አዘጋጅ\tCtrl+Alt+Y", self.script_planning)
         self._addMenuItem(ethMenu, "አጀንዳ\tCtrl+Alt+A", self.script_agenda)
         self._addMenuItem(ethMenu, "አጀንዳ በመስኮት\tCtrl+Shift+Alt+A", self.script_agendaPage)
+        self._addMenuItem(ethMenu, "የቀን አጀንዳ\tCtrl+Alt+D", self.script_dayAgenda)
         self._addMenuItem(ethMenu, "በስንክሳር በቀን ፈልግ\tCtrl+Shift+Alt+S", self.script_synaxariumByDate)
         self._addMenuItem(ethMenu, "የዓመቱ ሙሉ መረጃ\tCtrl+Shift+Y", self.script_yearlyFeasts)
         self._addMenuItem(ethMenu, "የኢትዮጵያ ቀን ፈልግ\tCtrl+Shift+D", self.script_searchDate)
@@ -2417,8 +3017,15 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         self._addMenuItem(perMenu, "የእርግዝና እና የወሊድ ጊዜ መገመቻ\tCtrl+Alt+N", self.script_calculatePregnancy)
         self._addMenuItem(perMenu, "ዕድሜ ማስያ\tCtrl+Shift+N", self.script_calculateAge)
 
+        gitMenu = wx.Menu()
+        self._addMenuItem(gitMenu, "የዛሬ ግጻዌ (የቤተክርስቲያን ንባቦች)\tCtrl+Shift+R", self.script_gitsaweReadings)
+        self._addMenuItem(gitMenu, "በግጻዌ ውስጥ ፈልግ\tCtrl+Alt+R", self.script_gitsaweSearch)
+        self._addMenuItem(gitMenu, "በግጻዌ በቀን ፈልግ", self.script_gitsaweByDate)
+        self._addMenuItem(gitMenu, "የግጻዌ መጽሐፍ ማውጫ\tCtrl+Alt+S", self.script_gitsaweStructure)
+
         rootMenu = wx.Menu()
         rootMenu.AppendSubMenu(ethMenu, "የኢትዮጵያ ቀን አቆጣጠር")
+        rootMenu.AppendSubMenu(gitMenu, "ግጻዌ")
         rootMenu.AppendSubMenu(islMenu, "የእስልምና ቀን አቆጣጠር")
         rootMenu.AppendSubMenu(hebMenu, "የዕብራውያን ቀን አቆጣጠር")
         rootMenu.AppendSubMenu(perMenu, "የወር አበባ፣ እርግዝና እና ዕድሜ")
@@ -2623,7 +3230,7 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         return "🌘 እየጎደለ የሚሄድ (Waning Crescent)"
 
     def get_addis_sun_times(self, g_date):
-        start = datetime.date(g_date.year, 1, 1)
+        start = datetime.date(g_date.year - 1, 12, 31)
         day_of_year = (g_date - start).days
         offset_minutes = 25 * math.sin(2 * math.pi * (day_of_year - 80) / 365)
         rise_min = round(15 - offset_minutes)
@@ -3461,27 +4068,27 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         window_end = self.eth_to_gregorian(ey + 1, 1, 1) - datetime.timedelta(days=1)
         g_year_start = window_start.year
 
-        def entry(name_am, name_en, g_date, closed, note=""):
+        def entry(name_am, name_en, g_date, closed, note="", hid=""):
             return {
-                "name_am": name_am, "name_en": name_en, "gregorian": g_date,
+                "id": hid, "name_am": name_am, "name_en": name_en, "gregorian": g_date,
                 "weekday": WEEKDAYS[g_date.weekday()],
                 "ethiopian_label": self.format_eth_label(g_date), "closed": closed, "note": note,
             }
 
         celebrated = [
-            entry("እንቁጣጣሽ (አዲስ ዓመት)", "New Year", window_start, True),
-            entry("የዓድዋ ድል በዓል", "Adwa Victory Day", self.eth_to_gregorian(ey, 6, 23), True),
+            entry("እንቁጣጣሽ (አዲስ ዓመት)", "New Year", window_start, True, hid="hol_enkutatash"),
+            entry("የዓድዋ ድል በዓል", "Adwa Victory Day", self.eth_to_gregorian(ey, 6, 23), True, hid="hol_adwa"),
             entry("የዓለም የሠራተኞች ቀን", "International Workers' Day",
-                  datetime.date(g_year_start + 1, 5, 1), True),
+                  datetime.date(g_year_start + 1, 5, 1), True, hid="hol_labor"),
             entry("የአርበኞች ድል በዓል", "Ethiopian Patriots' Victory Day",
-                  self.eth_to_gregorian(ey, 8, 27), True),
+                  self.eth_to_gregorian(ey, 8, 27), True, hid="hol_patriots"),
         ]
 
         memorial = [
             entry("የብሔሮች፣ ብሔረሰቦችና ሕዝቦች ቀን", "Nations, Nationalities and Peoples' Day",
-                  self.eth_to_gregorian(ey, 3, 29), False),
+                  self.eth_to_gregorian(ey, 3, 29), False, hid="hol_nations_day"),
             entry("የሰማዕታት መታሰቢያ ቀን", "Ethiopian Martyrs' Day",
-                  self.eth_to_gregorian(ey, 6, 12), False),
+                  self.eth_to_gregorian(ey, 6, 12), False, hid="hol_martyrs_day"),
         ]
 
         meta = self.calculate_bahre_hasab(ey)
@@ -3496,27 +4103,95 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
 
         genna_day = 28 if ey % 4 == 0 else 29
         religious = [
-            entry("የመስቀል በዓል", "Meskel", self.eth_to_gregorian(ey, 1, 17), True),
-            entry("ገና (ልደት)", "Christmas", self.eth_to_gregorian(ey, 4, genna_day), True),
-            entry("ጥምቀት", "Epiphany", self.eth_to_gregorian(ey, 5, 11), True),
+            entry("የመስቀል በዓል", "Meskel", self.eth_to_gregorian(ey, 1, 17), True, hid="hol_meskel"),
+            entry("ገና (ልደት)", "Christmas", self.eth_to_gregorian(ey, 4, genna_day), True, hid="hol_genna"),
+            entry("ጥምቀት", "Epiphany", self.eth_to_gregorian(ey, 5, 11), True, hid="hol_timkat"),
         ]
         if siklet_day:
-            religious.append(entry("ስቅለት", "Good Friday", day_number_to_gregorian(siklet_day), True))
+            religious.append(entry("ስቅለት", "Good Friday", day_number_to_gregorian(siklet_day), True, hid="fest_siklet"))
         if tensae_day:
-            religious.append(entry("ትንሣኤ (ፋሲካ)", "Easter", day_number_to_gregorian(tensae_day), True))
+            religious.append(entry("ትንሣኤ (ፋሲካ)", "Easter", day_number_to_gregorian(tensae_day), True, hid="fest_tensae"))
 
         islamic_note = "ቀኑ ሂሳባዊ ነው፣ ከጨረቃ ምልከታ ጋር ሊለያይ ይችላል።"
         for occ in self.get_islamic_occurrences_in_range(3, 12, window_start, window_end):
-            religious.append(entry("መውሊድ", "Mawlid", occ, True, note=islamic_note))
+            religious.append(entry("መውሊድ", "Mawlid", occ, True, note=islamic_note, hid="hol_mawlid"))
         for occ in self.get_islamic_occurrences_in_range(10, 1, window_start, window_end):
-            religious.append(entry("ዒድ አልፈጥር", "Eid al-Fitr", occ, True, note=islamic_note))
+            religious.append(entry("ዒድ አልፈጥር", "Eid al-Fitr", occ, True, note=islamic_note, hid="hol_eid_fitr"))
         for occ in self.get_islamic_occurrences_in_range(12, 10, window_start, window_end):
-            religious.append(entry("ዒድ አልአድሐ (አረፋ)", "Eid al-Adha", occ, True, note=islamic_note))
+            religious.append(entry("ዒድ አልአድሐ (አረፋ)", "Eid al-Adha", occ, True, note=islamic_note, hid="hol_eid_adha"))
+
+        cultural_note = "ባህላዊና ሃይማኖታዊ በዓል።"
+        religious.append(entry("ቡሄ (ደብረ ታቦር)", "Buhe (Debre Tabor)", self.eth_to_gregorian(ey, 12, 13), None,
+                               note=cultural_note, hid="hol_buhe"))
+        religious.append(entry("አሸንዳ", "Ashenda", self.eth_to_gregorian(ey, 12, 16), None,
+                               note=cultural_note, hid="hol_ashenda"))
+        start_j = self.gregorian_to_jdn(window_start.year, window_start.month, window_start.day)
+        end_j = self.gregorian_to_jdn(window_end.year, window_end.month, window_end.day) + 1
+        heb_start = tuple(self.jdn_to_hebrew(start_j))[0]
+        heb_end = tuple(self.jdn_to_hebrew(end_j))[0]
+        for hy in range(heb_start - 1, heb_end + 2):
+            j = self.hebrew_to_jdn(hy, 2, 29)
+            if start_j <= j < end_j:
+                religious.append(entry("ስግድ", "Sigd", self.jdn_to_gregorian(j), None,
+                                       note="የቤተ እስራኤል በዓል፤ ቀኑ በዕብራውያን የቀን አቆጣጠር ሂሳብ የተሰላ ነው።", hid="hol_sigd"))
 
         celebrated.sort(key=lambda h: h["gregorian"])
         memorial.sort(key=lambda h: h["gregorian"])
         religious.sort(key=lambda h: h["gregorian"])
         return {"celebrated": celebrated, "memorial": memorial, "religious": religious}
+
+    @staticmethod
+    def _holiday_status(h):
+        if h.get("closed") is None:
+            return ""
+        return "ተቋማት ይዘጋሉ" if h["closed"] else "ተቋማት ክፍት ናቸው"
+
+    def get_fasting_periods(self, ey):
+        meta = self.calculate_bahre_hasab(ey)
+        feasts = self.calculate_movable_feasts(meta['MebajaHamer'], meta['Metqe'])
+        day = lambda k: (feasts[k]['m'] - 1) * 30 + feasts[k]['d']
+        f_nenewe, f_abiy, f_tensae, f_haw = day('nenewe'), day('abiy'), day('tensae'), day('hawaryat')
+        ranges = [("fast_nenewe", "ጾመ ነነዌ", f_nenewe, 3), ("fast_abiy", "ዐቢይ ጾም", f_abiy, f_tensae - f_abiy),
+                  ("fast_nebiyat", "ጾመ ነቢያት", 75, 44), ("fast_hawaryat", "ጾመ ሐዋርያት", f_haw, 305 - f_haw + 1),
+                  ("fast_filseta", "ጾመ ፍልሰታ", 331, 15)]
+        out = []
+        for fid, name, start, length in ranges:
+            s_em, s_ed = self.day_of_year_to_month_day(start)
+            e_em, e_ed = self.day_of_year_to_month_day(start + length - 1)
+            out.append({'id': fid, 'name': name, 'start': self.eth_to_gregorian(ey, s_em, s_ed),
+                        'end': self.eth_to_gregorian(ey, e_em, e_ed)})
+        return out
+
+    def get_movable_feasts_list(self, ey):
+        meta = self.calculate_bahre_hasab(ey)
+        feasts = self.calculate_movable_feasts(meta['MebajaHamer'], meta['Metqe'])
+        out = []
+        for key, d in feasts.items():
+            fid = ('fast_' if key in ('nenewe', 'abiy', 'hawaryat', 'dihnet') else 'fest_') + key
+            out.append(((d['m'] - 1) * 30 + d['d'], {'id': fid, 'name': self.get_feast_display_name(key),
+                                                   'gregorian': self.eth_to_gregorian(ey, d['m'], d['d'])}))
+        out.sort(key=lambda x: x[0])
+        return [o for _, o in out]
+
+    def build_year_ical(self, ey):
+        one = datetime.timedelta(days=1)
+        vevents = []
+        seen = {}
+
+        def uid(base):
+            seen[base] = seen.get(base, 0) + 1
+            return f"{base}-{ey}@ethio-calendar" if seen[base] == 1 else f"{base}-{seen[base]}-{ey}@ethio-calendar"
+
+        table = self.get_fdre_holidays(ey)
+        for key in ('celebrated', 'memorial', 'religious'):
+            for h in table[key]:
+                vevents.append(self._vevent(uid(h['id']), h['name_am'],
+                                            h['gregorian'], h['gregorian'] + one, h.get('note') or ''))
+        for f in self.get_fasting_periods(ey):
+            vevents.append(self._vevent(uid(f['id']), f['name'], f['start'], f['end'] + one))
+        for m in self.get_movable_feasts_list(ey):
+            vevents.append(self._vevent(uid(m['id']), m['name'], m['gregorian'], m['gregorian'] + one))
+        return self._calendar(vevents, f"የ{ey} ዓ.ም ብሔራዊ በዓላትና መታሰቢያ ቀናት")
 
     def get_todays_fdre_holiday(self, ey, em, ed):
         holidays = self.get_fdre_holidays(ey)
@@ -3532,21 +4207,39 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
 
     def build_fdre_holidays_html(self, ey):
         holidays = self.get_fdre_holidays(ey)
-        html = f"<h1>የ{ey} ዓ.ም ብሔራዊ በዓላት</h1>"
+        parts = ["<main lang='am'>", f"<h1>የ{ey} ዓ.ም ብሔራዊ በዓላት</h1>"]
 
         def render_section(title, items):
             section = f"<h2>{title}</h2><ul>"
             for h in items:
-                status = "ተቋማት ይዘጋሉ" if h["closed"] else "ተቋማት ክፍት ናቸው"
-                note_html = f" — {h['note']}" if h.get("note") else ""
-                section += f"<li><strong>{h['name_am']}</strong> ({h['name_en']})፦ {h['weekday']}፣ {h['gregorian'].strftime('%Y-%m-%d')} ({h['ethiopian_label']})። {status}።{note_html}</li>"
-            section += "</ul>"
-            return section
+                status = self._holiday_status(h)
+                status_html = f" {status}።" if status else ""
+                note_html = f" {h['note']}" if h.get("note") else ""
+                section += (f"<li><strong>{h['name_am']}</strong> ({h['name_en']})፦ {h['weekday']}፣ "
+                            f"{h['gregorian'].strftime('%Y-%m-%d')} ({h['ethiopian_label']})።{status_html}{note_html}</li>")
+            return section + "</ul>"
 
-        html += render_section("የተከበሩ ብሔራዊ በዓላት", holidays["celebrated"])
-        html += render_section("የመታሰቢያ ቀናት", holidays["memorial"])
-        html += render_section("የሃይማኖት በዓላት", holidays["religious"])
-        return html
+        parts.append(render_section("የተከበሩ ብሔራዊ በዓላት", holidays["celebrated"]))
+        parts.append(render_section("የመታሰቢያ ቀናት", holidays["memorial"]))
+        parts.append(render_section("የሃይማኖት በዓላት", holidays["religious"]))
+
+        parts.append("<h2>የአጽዋማት ወቅቶች</h2><ul>")
+        for f in self.get_fasting_periods(ey):
+            s_y, s_m, s_d = self.gregorian_to_ethiopian(f["start"].year, f["start"].month, f["start"].day)
+            e_y, e_m, e_d = self.gregorian_to_ethiopian(f["end"].year, f["end"].month, f["end"].day)
+            parts.append(f"<li><strong>{f['name']}</strong>፦ {self.get_month_name(s_m)} {s_d} – "
+                         f"{self.get_month_name(e_m)} {e_d} ({f['start'].strftime('%Y-%m-%d')} – "
+                         f"{f['end'].strftime('%Y-%m-%d')})</li>")
+        parts.append("</ul>")
+
+        parts.append("<h2>ተንቀሳቃሽ በዓላት</h2><ul>")
+        for m in self.get_movable_feasts_list(ey):
+            g = m["gregorian"]
+            _, e_m, e_d = self.gregorian_to_ethiopian(g.year, g.month, g.day)
+            parts.append(f"<li><strong>{m['name']}</strong>፦ {WEEKDAYS[g.weekday()]}፣ "
+                         f"{self.get_month_name(e_m)} {e_d} ({g.strftime('%Y-%m-%d')})</li>")
+        parts.append("</ul></main>")
+        return "".join(parts)
 
     # ============================================================
     # SYNAXARIUM BY DATE
@@ -3708,9 +4401,14 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
     def script_planning(self, gesture):
         gui.mainFrame.prePopup()
         dlg = PlanningDialog(gui.mainFrame, self)
-        dlg.ShowModal()
-        dlg.Destroy()
-        gui.mainFrame.postPopup()
+        try:
+            dlg.ShowModal()
+            action, plan = dlg.action, dlg.plan
+        finally:
+            dlg.Destroy()
+            gui.mainFrame.postPopup()
+        if action == 'page' and plan:
+            self.show_plan_page(plan, getattr(self, 'planning_columns', None))
 
     @scriptHandler.script(description="Open the integrated Ethiopian agenda.",
                           category="Ethiopian Calendar", gesture="kb:control+alt+a")
@@ -3718,28 +4416,125 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
     def script_agenda(self, gesture):
         gui.mainFrame.prePopup()
         dlg = AgendaDialog(gui.mainFrame, self)
-        dlg.ShowModal()
-        dlg.Destroy()
-        gui.mainFrame.postPopup()
+        try:
+            dlg.ShowModal()
+            action, show_done, day_date = dlg.action, dlg.show_done, dlg.day_date
+        finally:
+            dlg.Destroy()
+            gui.mainFrame.postPopup()
+        if action == 'page':
+            self.show_agenda_page(show_done)
+        elif action == 'day' and day_date:
+            self.show_day_agenda_page(*day_date)
 
     @scriptHandler.script(description="Show the agenda as a navigable HTML page.",
                           category="Ethiopian Calendar", gesture="kb:control+shift+alt+a")
     @guarded_by_shortcut_setting("agendaPage")
     def script_agendaPage(self, gesture):
         try:
-            items = self._agenda_items(show_done=True)
-            if not items:
-                ui.message("ምንም የአጀንዳ ውሂብ የለም።")
-                return
-            html = render_agenda_html(self, items)
-            self.show_html("አጀንዳ", html)
-            ui.message(f"አጀንዳው {len(items)} ውሂብ ይዟል። በርዕስ ለመዘዋወር H ይጠቀሙ።")
+            self.show_agenda_page(True)
         except Exception as e:
             ui.message(f"ስህተት፦ {e}")
 
     # ============================================================
     # ETHIOPIAN CALENDAR SCRIPTS
     # ============================================================
+    @scriptHandler.script(
+        description="Show the agenda, holidays, Synaxarium, Gitsawe and season info for a chosen Ethiopian date.",
+        category="Ethiopian Calendar", gesture="kb:control+alt+d"
+    )
+    @guarded_by_shortcut_setting("dayAgenda")
+    def script_dayAgenda(self, gesture):
+        wx.CallAfter(self._show_day_agenda_dialog)
+
+    def _show_day_agenda_dialog(self):
+        gui.mainFrame.prePopup()
+        dlg = None
+        chosen = None
+        try:
+            ey, em, ed = self.get_ethiopian_date()
+            dlg = DateChoiceDialog(gui.mainFrame, self, "የቀን አጀንዳ", ey, em, ed)
+            if dlg.ShowModal() == wx.ID_OK:
+                chosen = dlg.date()
+        except Exception as e:
+            ui.message(f"ስህተት፦ {e}")
+        finally:
+            if dlg is not None:
+                dlg.Destroy()
+            gui.mainFrame.postPopup()
+        if chosen:
+            try:
+                self.show_day_agenda_page(*chosen)
+            except Exception as e:
+                ui.message(f"ስህተት፦ {e}")
+
+    @scriptHandler.script(
+        description="Search the Gitsawe readings by a chosen Ethiopian month and day.",
+        category="Ethiopian Calendar"
+    )
+    @guarded_by_shortcut_setting("gitsaweByDate")
+    def script_gitsaweByDate(self, gesture):
+        wx.CallAfter(self._show_gitsawe_by_date)
+
+    def _show_gitsawe_by_date(self):
+        gui.mainFrame.prePopup()
+        dlg = None
+        chosen = None
+        try:
+            ey, em, ed = self.get_ethiopian_date()
+            dlg = DateChoiceDialog(gui.mainFrame, self, "በግጻዌ በቀን ፈልግ", ey, em, ed, with_year=False)
+            if dlg.ShowModal() == wx.ID_OK:
+                chosen = dlg.date()
+        except Exception as e:
+            ui.message(f"ስህተት፦ {e}")
+        finally:
+            if dlg is not None:
+                dlg.Destroy()
+            gui.mainFrame.postPopup()
+        if chosen:
+            try:
+                _, em, ed = chosen
+                self.load_gitsawe()
+                reading = self.get_day_reading(em, ed)
+                if not reading:
+                    ui.message("ለዚህ ቀን የግጻዌ መረጃ አልተገኘም።")
+                    return
+                self._open_gitsawe_page(em, ed, reading)
+            except Exception as e:
+                ui.message(f"ስህተት፦ {e}")
+
+    @scriptHandler.script(
+        description="Show the table of contents of the Gitsawe book.",
+        category="Ethiopian Calendar", gesture="kb:control+alt+s"
+    )
+    @guarded_by_shortcut_setting("gitsaweStructure")
+    def script_gitsaweStructure(self, gesture):
+        try:
+            _, structure = self.load_gitsawe()
+            if not structure or not structure.get("parts"):
+                ui.message("የግጻዌ መረጃ መጫን አልተቻለም።")
+                return
+            title = (structure.get("book") or {}).get("title") or "የመጽሐፉ ማውጫ"
+            self.show_html(title, render_gitsawe_structure_html(structure))
+            ui.message(f"{title}። በርዕስ ለመዘዋወር H ይጠቀሙ።")
+        except Exception as e:
+            ui.message(f"ስህተት፦ {e}")
+
+    @scriptHandler.script(
+        description="Export this year's holidays, fasting periods and movable feasts as an iCal file.",
+        category="Ethiopian Calendar", gesture="kb:control+alt+h"
+    )
+    @guarded_by_shortcut_setting("holidaysIcal")
+    def script_holidaysIcal(self, gesture):
+        wx.CallAfter(self._export_year_ical)
+
+    def _export_year_ical(self):
+        try:
+            ey, _, _ = self.get_ethiopian_date()
+            self._export_file(self.build_year_ical(ey), f"ethiopian-calendar-{ey}.ics", "text/calendar")
+        except Exception as e:
+            ui.message(f"ስህተት፦ {e}")
+
     @scriptHandler.script(description="Announces whether today is an FDRE public holiday and shows the full year's holiday calendar in a window.",
                           category="Ethiopian Calendar", gesture="kb:control+shift+a")
     @guarded_by_shortcut_setting("fdreHolidays")
@@ -3751,8 +4546,8 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
 
             category_label, holiday = self.get_todays_fdre_holiday(ey, em, ed)
             if holiday:
-                status = "ተቋማት ይዘጋሉ" if holiday["closed"] else "ተቋማት ክፍት ናቸው"
-                msg = f"ዛሬ {weekday}፣ {month_name} {ed} ቀን {ey} ዓ.ም {category_label} ነው፦ {holiday['name_am']} ({holiday['name_en']})። {status}። "
+                status = self._holiday_status(holiday)
+                msg = f"ዛሬ {weekday}፣ {month_name} {ed} ቀን {ey} ዓ.ም {category_label} ነው፦ {holiday['name_am']} ({holiday['name_en']})። " + (f"{status}። " if status else "")
             else:
                 msg = f"ዛሬ {weekday}፣ {month_name} {ed} ቀን {ey} ዓ.ም ብሔራዊ በዓል አይደለም። "
             msg += "ሙሉ ዝርዝሩ በመስኮቱ ውስጥ ይታያል።"
@@ -4460,6 +5255,13 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
             d = int((d_str or "").strip())
         except ValueError:
             ui.message("እባክዎ ትክክለኛ የቁጥር እሴቶችን ያስገቡ።")
+            return
+
+        if m < 1 or m > 13:
+            ui.message("ወር ከ1 እስከ 13 ብቻ መሆን አለበት።")
+            return
+        if abs(y) > 200000:
+            ui.message("የተሳሳተ ዓመት።")
             return
 
         try:
