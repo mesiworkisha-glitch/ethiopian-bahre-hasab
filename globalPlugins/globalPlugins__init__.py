@@ -3719,7 +3719,7 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         ranges = [
             ("ጾመ ነነዌ", nenewe_day, nenewe_day + 2),
             ("ዐቢይ ጾም", abiy_day, tensae_day - 1),
-            ("ጾመ ነቢያት", 75, 118),
+            ("ጾመ ነቢያት", 75, (118 if ey % 4 == 0 else 119) - 1),
             ("ጾመ ሐዋርያት", hawariat_day, 305),
             ("ጾመ ፍልሰታ", 331, 345),
         ]
@@ -3814,19 +3814,22 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
             feasts = self.calculate_movable_feasts(meta['MebajaHamer'], meta['Metqe'])
 
         current_day = self.ethiopian_day_of_year(em, ed)
+        genna_day = 118 if ey % 4 == 0 else 119
         nenewe_day = (feasts["nenewe"]["m"] - 1) * 30 + feasts["nenewe"]["d"]
         abiy_day = (feasts["abiy"]["m"] - 1) * 30 + feasts["abiy"]["d"]
         tensae_day = (feasts["tensae"]["m"] - 1) * 30 + feasts["tensae"]["d"]
         hawariat_day = (feasts["hawaryat"]["m"] - 1) * 30 + feasts["hawaryat"]["d"]
         pentecost_day = (feasts["parakletos"]["m"] - 1) * 30 + feasts["parakletos"]["d"]
 
+        if current_day in (genna_day, 131):
+            return "በዓል (አይጾምም)"
         if abiy_day and tensae_day and abiy_day <= current_day < tensae_day:
             result = "ዐቢይ ጾም"
             week_key = self.get_great_lent_week(current_day, feasts)
             if week_key:
                 result += f" ({self.get_great_lent_week_name(week_key)})"
             return result
-        if 75 <= current_day <= 118:
+        if 75 <= current_day < genna_day:
             return "ጾመ ነቢያት"
         if 331 <= current_day <= 345:
             return "ጾመ ፍልሰታ"
@@ -3838,8 +3841,6 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
             return "ኀምሳ ዕለት (Pentecost)"
         if current_day == 130:
             return "ጾመ ገሀድ (የጥምቀት ዋዜማ)"
-        if current_day in [119, 131]:
-            return "በዓል (አይጾምም)"
         try:
             g_date = self.eth_to_gregorian(ey, em, ed)
             weekday = WEEKDAYS[g_date.weekday()]
@@ -4152,7 +4153,7 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
         day = lambda k: (feasts[k]['m'] - 1) * 30 + feasts[k]['d']
         f_nenewe, f_abiy, f_tensae, f_haw = day('nenewe'), day('abiy'), day('tensae'), day('hawaryat')
         ranges = [("fast_nenewe", "ጾመ ነነዌ", f_nenewe, 3), ("fast_abiy", "ዐቢይ ጾም", f_abiy, f_tensae - f_abiy),
-                  ("fast_nebiyat", "ጾመ ነቢያት", 75, 44), ("fast_hawaryat", "ጾመ ሐዋርያት", f_haw, 305 - f_haw + 1),
+                  ("fast_nebiyat", "ጾመ ነቢያት", 75, (118 if ey % 4 == 0 else 119) - 75), ("fast_hawaryat", "ጾመ ሐዋርያት", f_haw, 305 - f_haw + 1),
                   ("fast_filseta", "ጾመ ፍልሰታ", 331, 15)]
         out = []
         for fid, name, start, length in ranges:
@@ -4176,21 +4177,26 @@ class GlobalPlugin(GitsaweMixin, PlanningAgendaMixin, globalPluginHandler.Global
     def build_year_ical(self, ey):
         one = datetime.timedelta(days=1)
         vevents = []
-        seen = {}
+        used = set()
 
-        def uid(base):
-            seen[base] = seen.get(base, 0) + 1
-            return f"{base}-{ey}@ethio-calendar" if seen[base] == 1 else f"{base}-{seen[base]}-{ey}@ethio-calendar"
+        def add(base, summary, start, end, note=''):
+            uid = f"{base}-{ey}@ethio-calendar"
+            if uid in used:
+                uid = f"{base}-start-{ey}@ethio-calendar"
+            used.add(uid)
+            vevents.append(self._vevent(uid, summary, start, end, note))
 
         table = self.get_fdre_holidays(ey)
+        holiday_ids = set()
         for key in ('celebrated', 'memorial', 'religious'):
             for h in table[key]:
-                vevents.append(self._vevent(uid(h['id']), h['name_am'],
-                                            h['gregorian'], h['gregorian'] + one, h.get('note') or ''))
+                holiday_ids.add(h['id'])
+                add(h['id'], h['name_am'], h['gregorian'], h['gregorian'] + one, h.get('note') or '')
         for f in self.get_fasting_periods(ey):
-            vevents.append(self._vevent(uid(f['id']), f['name'], f['start'], f['end'] + one))
+            add(f['id'], f['name'], f['start'], f['end'] + one)
         for m in self.get_movable_feasts_list(ey):
-            vevents.append(self._vevent(uid(m['id']), m['name'], m['gregorian'], m['gregorian'] + one))
+            if m['id'] not in holiday_ids:
+                add(m['id'], m['name'], m['gregorian'], m['gregorian'] + one)
         return self._calendar(vevents, f"የ{ey} ዓ.ም ብሔራዊ በዓላትና መታሰቢያ ቀናት")
 
     def get_todays_fdre_holiday(self, ey, em, ed):
